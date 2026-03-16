@@ -211,7 +211,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
-        & (supplier_df["JournalColC"].str.upper().str.startswith("AC", na=False))
+        & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
     ].copy()
 
     # PAIEMENTS = Debit > 0 + lettrage non vide (sans filtre AC)
@@ -262,7 +262,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
     unpaid_invoices = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] == "")
-        & (supplier_df["JournalColC"].str.upper().str.startswith("AC", na=False))
+        & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
         & (~supplier_df["LibelleColA"].apply(is_opening_balance_row))
     ].copy()
 
@@ -436,6 +436,7 @@ if uploaded_file is not None:
             st.error(f"Erreur pendant le traitement : {e}")
 else:
     st.info("Chargez un fichier Excel pour démarrer le traitement.")
+
 
 
 
