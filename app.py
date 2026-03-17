@@ -142,11 +142,11 @@ def extract_invoice_number(piece_text: str, libelle_text: str) -> str:
             return extracted
         return libelle
 
-    # Sinon on garde la pièce D
+    # Sinon on garde D
     if piece:
         return piece
 
-    # Si D est vide, on tente dans le libellé
+    # Si D est vide, on tente dans E
     extracted = extract_invoice_from_libelle(libelle)
     if extracted:
         return extracted
@@ -203,62 +203,138 @@ def prepare_supplier_data(df: pd.DataFrame, boundary: SupplierBoundary) -> pd.Da
     return supplier_df
 
 
+def allocate_fifo(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
+    allocations = []
+    residuals = []
+
+    if invoice_rows.empty:
+        return allocations, residuals
+
+    invoices = []
+    for _, inv in invoice_rows.iterrows():
+        invoices.append({
+            "row": inv,
+            "remaining": round(inv["Credit"], 2)
+        })
+
+    payments = []
+    for _, pay in payment_rows.iterrows():
+        payments.append({
+            "row": pay,
+            "remaining": round(pay["Debit"], 2)
+        })
+
+    pay_idx = 0
+
+    for invoice in invoices:
+        inv_row = invoice["row"]
+        invoice_total = round(inv_row["Credit"], 2)
+
+        while invoice["remaining"] > 0 and pay_idx < len(payments):
+            while pay_idx < len(payments) and payments[pay_idx]["remaining"] <= 0:
+                pay_idx += 1
+
+            if pay_idx >= len(payments):
+                break
+
+            pay_obj = payments[pay_idx]
+            allocated = round(min(invoice["remaining"], pay_obj["remaining"]), 2)
+
+            if allocated <= 0:
+                pay_idx += 1
+                continue
+
+            allocations.append({
+                "invoice_row": inv_row,
+                "payment_row": pay_obj["row"],
+                "allocated_amount": allocated,
+                "invoice_total": invoice_total,
+            })
+
+            invoice["remaining"] = round(invoice["remaining"] - allocated, 2)
+            pay_obj["remaining"] = round(pay_obj["remaining"] - allocated, 2)
+
+            if pay_obj["remaining"] <= 0:
+                pay_idx += 1
+
+        if invoice["remaining"] > 0:
+            residuals.append({
+                "invoice_row": inv_row,
+                "remaining_amount": round(invoice["remaining"], 2),
+                "invoice_total": invoice_total,
+            })
+
+    return allocations, residuals
+
+
 def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
     paid_rows = []
     unpaid_rows = []
 
-    # FACTURES PAYEES = Credit > 0 + lettrage non vide + journal AC
+    # ============================================================
+    # 1) FACTURES LETTRÉES / PAIEMENTS LETTRÉS
+    # ============================================================
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
     ].copy()
 
-    # PAIEMENTS = Debit > 0 + lettrage non vide (sans filtre AC)
     payments_lettered = supplier_df[
         (supplier_df["Debit"] > 0)
         & (supplier_df["Lettrage"] != "")
     ].copy()
 
-    for _, inv in invoices_lettered.iterrows():
-        letter = inv["Lettrage"]
-        matching_payments = payments_lettered[payments_lettered["Lettrage"] == letter].copy()
+    if not invoices_lettered.empty:
+        for letter in sorted(invoices_lettered["Lettrage"].dropna().unique()):
+            inv_group = invoices_lettered[invoices_lettered["Lettrage"] == letter].copy()
+            pay_group = payments_lettered[payments_lettered["Lettrage"] == letter].copy()
 
-        if matching_payments.empty:
-            continue
+            if pay_group.empty:
+                continue
 
-        payment_date = matching_payments["DateOperation"].max()
-        invoice_date = inv["DateOperation"]
+            inv_group = inv_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
+            pay_group = pay_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-        if pd.isna(invoice_date) or pd.isna(payment_date):
-            delay_days = None
-            remark = "Date facture ou date paiement invalide"
-        else:
-            delay_days = int((payment_date - invoice_date).days + 1)
-            remark = classify_remark(delay_days)
+            allocations, _ = allocate_fifo(inv_group, pay_group)
 
-        paid_rows.append({
-            "Code fournisseur": boundary.supplier_code,
-            "Nom fournisseur": boundary.supplier_name,
-            "Libellé": inv["LibelleColE"],
-            "Numero facture": inv["NumeroFacture"],
-            "Type": "Facture payée",
-            "Journal": inv["JournalColC"],
-            "Lettrage": letter,
-            "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-            "Date paiement": payment_date.date() if pd.notna(payment_date) else None,
-            "Montant facture": round(inv["Credit"], 2),
-            "Montant(s) paiement(s) total": round(matching_payments["Debit"].sum(), 2),
-            "Délai (jours)": delay_days,
-            "Remarque": remark,
-            "Ligne source facture": int(inv["original_row"]) + 2,
-        })
+            for alloc in allocations:
+                inv = alloc["invoice_row"]
+                pay = alloc["payment_row"]
+                allocated_amount = alloc["allocated_amount"]
+                invoice_total = alloc["invoice_total"]
 
-    # Lignes d'ouverture
-    opening_rows = supplier_df[supplier_df["LibelleColA"].apply(is_opening_balance_row)].copy()
-    opening_advance_amount = round(opening_rows["Debit"].sum(), 2)
+                invoice_date = inv["DateOperation"]
+                payment_date = pay["DateOperation"]
 
-    # FACTURES NON PAYEES = Credit > 0 + lettrage vide + journal AC + hors lignes d'ouverture
+                if pd.isna(invoice_date) or pd.isna(payment_date):
+                    delay_days = None
+                    remark = "Date facture ou date paiement invalide"
+                else:
+                    delay_days = int((payment_date - invoice_date).days + 1)
+                    remark = classify_remark(delay_days)
+
+                paid_rows.append({
+                    "Code fournisseur": boundary.supplier_code,
+                    "Nom fournisseur": boundary.supplier_name,
+                    "Libellé": inv["LibelleColE"],
+                    "Numero facture": inv["NumeroFacture"],
+                    "Type": "Facture payée",
+                    "Journal": inv["JournalColC"],
+                    "Lettrage": letter,
+                    "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                    "Date paiement": payment_date.date() if pd.notna(payment_date) else None,
+                    "Montant facture": round(allocated_amount, 2),
+                    "Montant(s) paiement(s) total": round(allocated_amount, 2),
+                    "Montant facture origine": round(invoice_total, 2),
+                    "Délai (jours)": delay_days,
+                    "Remarque": remark,
+                    "Ligne source facture": int(inv["original_row"]) + 2,
+                })
+
+    # ============================================================
+    # 2) FACTURES NON LETTRÉES + AVANCES + PAIEMENTS NON LETTRÉS (FIFO)
+    # ============================================================
     unpaid_invoices = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] == "")
@@ -268,63 +344,184 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
 
     unpaid_invoices = unpaid_invoices.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-    for _, inv in unpaid_invoices.iterrows():
-        invoice_date = inv["DateOperation"]
-        remaining_amount = round(inv["Credit"], 2)
+    # Lignes d'ouverture : "Total au 01/01/2025" au débit = avance
+    opening_rows = supplier_df[supplier_df["LibelleColA"].apply(is_opening_balance_row)].copy()
+    opening_advance_amount = round(opening_rows["Debit"].sum(), 2)
 
-        if opening_advance_amount > 0:
-            allocated_advance = min(opening_advance_amount, remaining_amount)
+    # Paiements non lettrés réels
+    unlettered_payments = supplier_df[
+        (supplier_df["Debit"] > 0)
+        & (supplier_df["Lettrage"] == "")
+        & (~supplier_df["LibelleColA"].apply(is_opening_balance_row))
+    ].copy()
 
-            if allocated_advance > 0:
-                if pd.isna(invoice_date):
-                    delay_days_advance = None
-                else:
-                    delay_days_advance = int((OPENING_DATE - invoice_date).days + 1)
+    unlettered_payments = unlettered_payments.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-                unpaid_rows.append({
-                    "Code fournisseur": boundary.supplier_code,
-                    "Nom fournisseur": boundary.supplier_name,
-                    "Libellé": inv["LibelleColE"],
-                    "Numero facture": inv["NumeroFacture"],
-                    "Type": "Avance imputée",
-                    "Journal": inv["JournalColC"],
-                    "Lettrage": "",
-                    "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-                    "Date paiement": OPENING_DATE.date(),
-                    "Montant facture": round(allocated_advance, 2),
-                    "Montant(s) paiement(s) total": round(allocated_advance, 2),
-                    "Délai (jours)": delay_days_advance,
-                    "Remarque": classify_remark(delay_days_advance),
-                    "Ligne source facture": int(inv["original_row"]) + 2,
-                })
+    # 2A) Imputation de l'avance d'ouverture au 01/01/2025
+    if not unpaid_invoices.empty and opening_advance_amount > 0:
+        pseudo_opening_payment = pd.DataFrame([{
+            "DateOperation": OPENING_DATE,
+            "Debit": opening_advance_amount,
+            "original_row": -1
+        }])
 
-                opening_advance_amount = round(opening_advance_amount - allocated_advance, 2)
-                remaining_amount = round(remaining_amount - allocated_advance, 2)
+        opening_allocations, opening_residuals = allocate_fifo(unpaid_invoices, pseudo_opening_payment)
 
-        if remaining_amount <= 0:
-            continue
+        consumed_invoice_ids = set()
 
-        if pd.isna(invoice_date):
-            delay_days = None
-        else:
-            delay_days = int((REFERENCE_DATE - invoice_date).days + 1)
+        for alloc in opening_allocations:
+            inv = alloc["invoice_row"]
+            allocated_amount = alloc["allocated_amount"]
+            invoice_total = alloc["invoice_total"]
+            invoice_date = inv["DateOperation"]
 
-        unpaid_rows.append({
-            "Code fournisseur": boundary.supplier_code,
-            "Nom fournisseur": boundary.supplier_name,
-            "Libellé": inv["LibelleColE"],
-            "Numero facture": inv["NumeroFacture"],
-            "Type": "Facture non payée",
-            "Journal": inv["JournalColC"],
-            "Lettrage": "",
-            "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-            "Date paiement": None,
-            "Montant facture": round(remaining_amount, 2),
-            "Montant(s) paiement(s) total": 0.0,
-            "Délai (jours)": delay_days,
-            "Remarque": classify_remark(delay_days),
-            "Ligne source facture": int(inv["original_row"]) + 2,
-        })
+            if pd.isna(invoice_date):
+                delay_days = None
+            else:
+                delay_days = int((OPENING_DATE - invoice_date).days + 1)
+
+            unpaid_rows.append({
+                "Code fournisseur": boundary.supplier_code,
+                "Nom fournisseur": boundary.supplier_name,
+                "Libellé": inv["LibelleColE"],
+                "Numero facture": inv["NumeroFacture"],
+                "Type": "Avance imputée",
+                "Journal": inv["JournalColC"],
+                "Lettrage": "",
+                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                "Date paiement": OPENING_DATE.date(),
+                "Montant facture": round(allocated_amount, 2),
+                "Montant(s) paiement(s) total": round(allocated_amount, 2),
+                "Montant facture origine": round(invoice_total, 2),
+                "Délai (jours)": delay_days,
+                "Remarque": classify_remark(delay_days),
+                "Ligne source facture": int(inv["original_row"]) + 2,
+            })
+
+            consumed_invoice_ids.add(int(inv["original_row"]))
+
+        remaining_invoice_rows = []
+        residual_map = {}
+
+        for res in opening_residuals:
+            inv = res["invoice_row"]
+            residual_map[int(inv["original_row"])] = round(res["remaining_amount"], 2)
+            remaining_invoice_rows.append(inv)
+
+        for _, inv in unpaid_invoices.iterrows():
+            key = int(inv["original_row"])
+            if key not in residual_map and key not in consumed_invoice_ids:
+                residual_map[key] = round(inv["Credit"], 2)
+                remaining_invoice_rows.append(inv)
+
+        unpaid_working = unpaid_invoices.copy()
+        unpaid_working["RemainingAfterOpening"] = unpaid_working["original_row"].apply(
+            lambda x: residual_map.get(int(x), 0.0)
+        )
+        unpaid_working = unpaid_working[unpaid_working["RemainingAfterOpening"] > 0].copy()
+        unpaid_working["Credit"] = unpaid_working["RemainingAfterOpening"]
+        unpaid_working = unpaid_working.drop(columns=["RemainingAfterOpening"])
+    else:
+        unpaid_working = unpaid_invoices.copy()
+
+    # 2B) Paiements non lettrés => FIFO sur factures non lettrées
+    if not unpaid_working.empty and not unlettered_payments.empty:
+        fifo_allocations, fifo_residuals = allocate_fifo(unpaid_working, unlettered_payments)
+
+        for alloc in fifo_allocations:
+            inv = alloc["invoice_row"]
+            pay = alloc["payment_row"]
+            allocated_amount = alloc["allocated_amount"]
+            invoice_total = alloc["invoice_total"]
+
+            invoice_date = inv["DateOperation"]
+            payment_date = pay["DateOperation"]
+
+            if pd.isna(invoice_date) or pd.isna(payment_date):
+                delay_days = None
+                remark = "Date facture ou date paiement invalide"
+            else:
+                delay_days = int((payment_date - invoice_date).days + 1)
+                remark = classify_remark(delay_days)
+
+            unpaid_rows.append({
+                "Code fournisseur": boundary.supplier_code,
+                "Nom fournisseur": boundary.supplier_name,
+                "Libellé": inv["LibelleColE"],
+                "Numero facture": inv["NumeroFacture"],
+                "Type": "Paiement non lettré imputé FIFO",
+                "Journal": inv["JournalColC"],
+                "Lettrage": "",
+                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                "Date paiement": payment_date.date() if pd.notna(payment_date) else None,
+                "Montant facture": round(allocated_amount, 2),
+                "Montant(s) paiement(s) total": round(allocated_amount, 2),
+                "Montant facture origine": round(invoice_total, 2),
+                "Délai (jours)": delay_days,
+                "Remarque": remark,
+                "Ligne source facture": int(inv["original_row"]) + 2,
+            })
+
+        for res in fifo_residuals:
+            inv = res["invoice_row"]
+            remaining_amount = round(res["remaining_amount"], 2)
+            invoice_total = round(res["invoice_total"], 2)
+            invoice_date = inv["DateOperation"]
+
+            if pd.isna(invoice_date):
+                delay_days = None
+            else:
+                delay_days = int((REFERENCE_DATE - invoice_date).days + 1)
+
+            unpaid_rows.append({
+                "Code fournisseur": boundary.supplier_code,
+                "Nom fournisseur": boundary.supplier_name,
+                "Libellé": inv["LibelleColE"],
+                "Numero facture": inv["NumeroFacture"],
+                "Type": "Facture non payée",
+                "Journal": inv["JournalColC"],
+                "Lettrage": "",
+                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                "Date paiement": None,
+                "Montant facture": round(remaining_amount, 2),
+                "Montant(s) paiement(s) total": 0.0,
+                "Montant facture origine": invoice_total,
+                "Délai (jours)": delay_days,
+                "Remarque": classify_remark(delay_days),
+                "Ligne source facture": int(inv["original_row"]) + 2,
+            })
+
+    else:
+        # Aucun paiement non lettré ou aucune facture non lettrée => rester sur la logique "non payée"
+        for _, inv in unpaid_working.iterrows():
+            invoice_date = inv["DateOperation"]
+            remaining_amount = round(inv["Credit"], 2)
+
+            if remaining_amount <= 0:
+                continue
+
+            if pd.isna(invoice_date):
+                delay_days = None
+            else:
+                delay_days = int((REFERENCE_DATE - invoice_date).days + 1)
+
+            unpaid_rows.append({
+                "Code fournisseur": boundary.supplier_code,
+                "Nom fournisseur": boundary.supplier_name,
+                "Libellé": inv["LibelleColE"],
+                "Numero facture": inv["NumeroFacture"],
+                "Type": "Facture non payée",
+                "Journal": inv["JournalColC"],
+                "Lettrage": "",
+                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                "Date paiement": None,
+                "Montant facture": round(remaining_amount, 2),
+                "Montant(s) paiement(s) total": 0.0,
+                "Montant facture origine": round(inv["Credit"], 2),
+                "Délai (jours)": delay_days,
+                "Remarque": classify_remark(delay_days),
+                "Ligne source facture": int(inv["original_row"]) + 2,
+            })
 
     return paid_rows, unpaid_rows
 
@@ -344,24 +541,45 @@ def process_workbook(uploaded_file, sheet_name=None):
 
     all_paid = []
     all_unpaid = []
+    control_rows = []
 
     for boundary in suppliers:
         supplier_df = prepare_supplier_data(df, boundary)
         paid_rows, unpaid_rows = process_supplier(boundary, supplier_df)
+
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
 
+        control_rows.append({
+            "Code fournisseur": boundary.supplier_code,
+            "Nom fournisseur": boundary.supplier_name,
+            "Ligne début": boundary.start_row + 2,
+            "Ligne fin Total": boundary.end_row + 2,
+            "Nb lignes payées": len(paid_rows),
+            "Nb lignes non payées": len(unpaid_rows),
+        })
+
     paid_df = pd.DataFrame(all_paid)
     unpaid_df = pd.DataFrame(all_unpaid)
+    control_df = pd.DataFrame(control_rows)
 
-    return paid_df, unpaid_df
+    result_df = pd.concat([paid_df, unpaid_df], ignore_index=True)
+    if not result_df.empty:
+        result_df = result_df.sort_values(
+            by=["Code fournisseur", "Nom fournisseur", "Date facture", "Type"],
+            na_position="last"
+        ).reset_index(drop=True)
+
+    return result_df, paid_df, unpaid_df, control_df
 
 
-def to_excel_bytes(paid_df: pd.DataFrame, unpaid_df: pd.DataFrame) -> bytes:
+def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame, unpaid_df: pd.DataFrame, control_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        result_df.to_excel(writer, index=False, sheet_name="Resultat global")
         paid_df.to_excel(writer, index=False, sheet_name="Factures payees")
         unpaid_df.to_excel(writer, index=False, sheet_name="Factures non payees")
+        control_df.to_excel(writer, index=False, sheet_name="Controle fournisseurs")
 
         for sheet in writer.book.worksheets:
             for column_cells in sheet.columns:
@@ -389,9 +607,10 @@ with st.expander("Format attendu du fichier Excel", expanded=False):
 - **Colonne G** : crédit
 - **Colonne H** : lettrage
 
-**Règle importante :**
-Seules les lignes dont le **journal en colonne C commence par `AC`** sont considérées comme des **factures**.
-Les journaux `OD`, `BQ`, etc. sont exclus des factures, même s’il y a un montant au crédit.
+**Règles importantes :**
+- Les **factures** sont prises seulement si le **journal colonne C commence par `A`**
+- Si la **Pièce D** ressemble à un code interne type `AC25080025` ou `BQ425010004`, on cherche le numéro dans le **Libellé E**
+- Les paiements non lettrés sont imputés en **FIFO** sur les factures non lettrées du même fournisseur
 """
     )
 
@@ -410,21 +629,22 @@ if uploaded_file is not None:
     if st.button("Lancer le traitement", type="primary"):
         try:
             uploaded_file.seek(0)
-            paid_df, unpaid_df = process_workbook(uploaded_file, selected_sheet)
+            result_df, paid_df, unpaid_df, control_df = process_workbook(uploaded_file, selected_sheet)
 
             st.success("Traitement terminé avec succès.")
 
-            c1, c2 = st.columns(2)
-            c1.metric("Factures payées", len(paid_df))
-            c2.metric("Factures non payées", len(unpaid_df))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Lignes payées", len(paid_df))
+            c2.metric("Lignes non payées", len(unpaid_df))
+            c3.metric("Total lignes résultat", len(result_df))
 
-            st.subheader("Factures payées")
-            st.dataframe(paid_df, use_container_width=True)
+            st.subheader("Résultat global")
+            st.dataframe(result_df, use_container_width=True)
 
-            st.subheader("Factures non payées")
-            st.dataframe(unpaid_df, use_container_width=True)
+            st.subheader("Contrôle fournisseurs détectés")
+            st.dataframe(control_df, use_container_width=True)
 
-            excel_bytes = to_excel_bytes(paid_df, unpaid_df)
+            excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
             st.download_button(
                 label="Télécharger le fichier résultat",
                 data=excel_bytes,
@@ -436,7 +656,3 @@ if uploaded_file is not None:
             st.error(f"Erreur pendant le traitement : {e}")
 else:
     st.info("Chargez un fichier Excel pour démarrer le traitement.")
-
-
-
-
