@@ -533,11 +533,11 @@ def process_workbook(uploaded_file, sheet_name=None):
         df = pd.read_excel(uploaded_file, header=0)
 
     if df.shape[1] < 8:
-        raise ValueError("Le fichier doit contenir au minimum 8 colonnes (A à H).")
+        raise ValueError("Le fichier doit contenir au minimum 8 colonnes (A ? H).")
 
     suppliers = find_supplier_boundaries(df)
     if not suppliers:
-        raise ValueError("Aucun fournisseur détecté dans la colonne A.")
+        raise ValueError("Aucun fournisseur d?tect? dans la colonne A.")
 
     all_paid = []
     all_unpaid = []
@@ -550,13 +550,63 @@ def process_workbook(uploaded_file, sheet_name=None):
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
 
+        # IMPORTANT :
+        # Total cr?dit source = tous les cr?dits du fournisseur
+        # SAUF les lignes dont le libell? colonne E est exactement "Total au 01/01/2025"
+        total_credit_source = round(
+            supplier_df.loc[
+                (supplier_df["Credit"] > 0)
+                & (
+                    supplier_df["LibelleColE"]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    != "total au 01/01/2025"
+                ),
+                "Credit"
+            ].sum(),
+            2
+        )
+
+                # Reconstitution exhaustive du total factures :
+        # on additionne toutes les fractions d'une m?me facture
+        # (pay?e, pay?e FIFO, non pay?e) pour retrouver son montant total
+        all_rows = paid_rows + unpaid_rows
+
+        factures_reconstituees = {}
+
+        for r in all_rows:
+            key = (
+                r.get("Code fournisseur"),
+                r.get("Numero facture"),
+            )
+
+            montant_ligne = float(r.get("Montant facture", 0) or 0)
+
+            if key not in factures_reconstituees:
+                factures_reconstituees[key] = 0.0
+
+            factures_reconstituees[key] += montant_ligne
+
+        total_factures_retenues = round(
+            sum(factures_reconstituees.values()),
+            2
+        )
+
+        ecart = round(total_credit_source - total_factures_retenues, 2)
+
         control_rows.append({
             "Code fournisseur": boundary.supplier_code,
             "Nom fournisseur": boundary.supplier_name,
-            "Ligne début": boundary.start_row + 2,
+            "Ligne d?but": boundary.start_row + 2,
             "Ligne fin Total": boundary.end_row + 2,
-            "Nb lignes payées": len(paid_rows),
-            "Nb lignes non payées": len(unpaid_rows),
+            "Nb lignes pay?es": len(paid_rows),
+            "Nb lignes non pay?es": len(unpaid_rows),
+            "Total cr?dit source": total_credit_source,
+            "Total factures retenues": total_factures_retenues,
+            "?cart": ecart,
+            "Statut contr?le": "OK" if abs(ecart) < 0.01 else "?cart ? analyser",
         })
 
     paid_df = pd.DataFrame(all_paid)
@@ -656,3 +706,7 @@ if uploaded_file is not None:
             st.error(f"Erreur pendant le traitement : {e}")
 else:
     st.info("Chargez un fichier Excel pour démarrer le traitement.")
+
+
+
+
