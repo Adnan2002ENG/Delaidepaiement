@@ -21,6 +21,19 @@ EXPECTED_COL_INDEX = {
     "lettrage": 7
 }
 
+# Colonnes GL PENNYLAND (indices 0-basés, fichier lu avec header=1)
+PENNYLAND_COL_INDEX = {
+    "account":     0,   # N° de compte  → code / clé de groupement fournisseur
+    "name":        1,   # Libellé de compte → nom fournisseur
+    "date":        2,   # Date
+    "journal":     3,   # Journal  (AC=facture, BQ*=paiement, AA=report à nouveau)
+    "libelle":     4,   # Libellé de pièce
+    "num_facture": 7,   # N° de facture  (col H)
+    "lettrage":    9,   # Let.  (col J)
+    "debit":       10,  # Débit  (col K)
+    "credit":      11,  # Crédit (col L)
+}
+
 
 @dataclass
 class SupplierBoundary:
@@ -144,6 +157,92 @@ def extract_invoice_number(piece_text: str, libelle_text: str) -> str:
     return ""
 
 
+def find_supplier_boundaries_pennyland(df: pd.DataFrame) -> List[SupplierBoundary]:
+    """Détecte les fournisseurs dans un GL Pennyland.
+    Chaque groupe de lignes consécutives partageant le même N° de compte = un fournisseur.
+    Le fichier doit être lu avec header=1 (la ligne 0 blank est sautée automatiquement).
+    """
+    suppliers = []
+    current_account = None
+    current_name = None
+    start_row = None
+
+    for idx in range(len(df)):
+        account = normalize_text(df.iat[idx, PENNYLAND_COL_INDEX["account"]])
+        name    = normalize_text(df.iat[idx, PENNYLAND_COL_INDEX["name"]])
+
+        # Ignorer lignes vides / NaN
+        if not account or account.lower() in ("nan", ""):
+            if current_account is not None:
+                suppliers.append(SupplierBoundary(
+                    supplier_code=current_account,
+                    supplier_name=current_name,
+                    start_row=start_row,
+                    end_row=idx - 1,
+                ))
+                current_account = None
+                current_name = None
+                start_row = None
+            continue
+
+        if account != current_account:
+            if current_account is not None:
+                suppliers.append(SupplierBoundary(
+                    supplier_code=current_account,
+                    supplier_name=current_name,
+                    start_row=start_row,
+                    end_row=idx - 1,
+                ))
+            current_account = account
+            current_name    = name
+            start_row       = idx
+
+    # Dernier fournisseur
+    if current_account is not None:
+        suppliers.append(SupplierBoundary(
+            supplier_code=current_account,
+            supplier_name=current_name,
+            start_row=start_row,
+            end_row=len(df) - 1,
+        ))
+
+    return suppliers
+
+
+def prepare_supplier_data_pennyland(df: pd.DataFrame, boundary: SupplierBoundary,
+                                     row_offset: int = 0) -> pd.DataFrame:
+    """Prépare les données d'un fournisseur depuis un GL Pennyland.
+    Retourne un DataFrame aux mêmes colonnes normalisées que prepare_supplier_data (COALA).
+    """
+    supplier_df = df.iloc[boundary.start_row: boundary.end_row + 1].copy()
+    supplier_df = supplier_df.reset_index(drop=False).rename(columns={"index": "original_row"})
+    supplier_df["original_row"] = supplier_df["original_row"] + row_offset
+
+    # +1 sur chaque index car reset_index() a inséré la colonne "original_row" en position 0
+    ci = PENNYLAND_COL_INDEX
+
+    result = pd.DataFrame()
+    result["original_row"] = supplier_df["original_row"]
+
+    # Identifiant fournisseur (N° de compte) dans LibelleColA pour compatibilité
+    result["LibelleColA"]  = supplier_df.iloc[:, ci["account"] + 1].apply(normalize_text)
+    result["DateOperation"] = supplier_df.iloc[:, ci["date"] + 1].apply(safe_date)
+    result["JournalColC"]  = supplier_df.iloc[:, ci["journal"] + 1].apply(normalize_text)
+    result["LibelleColE"]  = supplier_df.iloc[:, ci["libelle"] + 1].apply(normalize_text)
+    result["Debit"]        = supplier_df.iloc[:, ci["debit"] + 1].apply(normalize_amount)
+    result["Credit"]       = supplier_df.iloc[:, ci["credit"] + 1].apply(normalize_amount)
+    result["Lettrage"]     = supplier_df.iloc[:, ci["lettrage"] + 1].apply(normalize_text)
+
+    # N° de facture : col H directement ; fallback sur Libellé de pièce si vide
+    raw_num = supplier_df.iloc[:, ci["num_facture"] + 1].apply(normalize_text).tolist()
+    result["NumeroFacture"] = [
+        n if n else lib
+        for n, lib in zip(raw_num, result["LibelleColE"])
+    ]
+
+    return result
+
+
 def find_supplier_boundaries(df: pd.DataFrame) -> List[SupplierBoundary]:
     suppliers = []
     current_supplier = None
@@ -192,6 +291,78 @@ def prepare_supplier_data(df: pd.DataFrame, boundary: SupplierBoundary, row_offs
     )
 
     return supplier_df
+
+
+def allocate_amount_match(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
+    """Allocation par montant identique (format GL PENNYLAND).
+    Pour chaque facture, on cherche le paiement dont le montant restant est identique.
+    Si aucun paiement de montant exact n'est trouvé, on applique FIFO en dernier recours.
+    """
+    allocations = []
+    residuals   = []
+
+    if invoice_rows.empty:
+        return allocations, residuals
+
+    available = []
+    for _, pay in payment_rows.iterrows():
+        available.append({"row": pay, "remaining": round(pay["Debit"], 2)})
+
+    for _, inv in invoice_rows.iterrows():
+        inv_amount = round(inv["Credit"], 2)
+
+        # Chercher un paiement de montant exact (tolérance 0.01)
+        best_idx = None
+        for i, pay_obj in enumerate(available):
+            if pay_obj["remaining"] <= 0:
+                continue
+            if abs(pay_obj["remaining"] - inv_amount) < 0.01:
+                best_idx = i
+                break
+
+        if best_idx is not None:
+            pay_obj = available[best_idx]
+            allocations.append({
+                "invoice_row":    inv,
+                "payment_row":    pay_obj["row"],
+                "allocated_amount": inv_amount,
+                "invoice_total":  inv_amount,
+            })
+            pay_obj["remaining"] = round(pay_obj["remaining"] - inv_amount, 2)
+        else:
+            # Aucun paiement de montant exact → FIFO partiel
+            matched = False
+            for pay_obj in available:
+                if pay_obj["remaining"] <= 0:
+                    continue
+                allocated = round(min(inv_amount, pay_obj["remaining"]), 2)
+                if allocated <= 0:
+                    continue
+                allocations.append({
+                    "invoice_row":    inv,
+                    "payment_row":    pay_obj["row"],
+                    "allocated_amount": allocated,
+                    "invoice_total":  inv_amount,
+                })
+                pay_obj["remaining"] = round(pay_obj["remaining"] - allocated, 2)
+                remaining_inv = round(inv_amount - allocated, 2)
+                if remaining_inv > 0.01:
+                    residuals.append({
+                        "invoice_row":    inv,
+                        "remaining_amount": remaining_inv,
+                        "invoice_total":  inv_amount,
+                    })
+                matched = True
+                break
+
+            if not matched:
+                residuals.append({
+                    "invoice_row":    inv,
+                    "remaining_amount": inv_amount,
+                    "invoice_total":  inv_amount,
+                })
+
+    return allocations, residuals
 
 
 def allocate_fifo(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
@@ -260,11 +431,32 @@ def allocate_fifo(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
 
 def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                      reference_date: pd.Timestamp, opening_date: pd.Timestamp,
-                     mode: str = "civile", year_filter: Optional[int] = None):
+                     mode: str = "civile", year_filter: Optional[int] = None,
+                     gl_format: str = "coala"):
+    """
+    gl_format : "coala"    → détection solde ouverture via LibelleColA, allocation FIFO
+                "pennyland" → détection solde ouverture via JournalColC=="AA", allocation par montant
+    """
     paid_rows = []
     unpaid_rows = []
 
     has_source_file = "source_file" in supplier_df.columns
+
+    # --- Masque solde d'ouverture (varie selon le format) ---
+    # "mixed" = un fichier COALA + un fichier PENNYLAND → on combine les deux détections
+    if gl_format == "pennyland":
+        opening_mask = supplier_df["JournalColC"].str.upper() == "AA"
+    elif gl_format == "mixed":
+        opening_mask = (
+            (supplier_df["JournalColC"].str.upper() == "AA")
+            | supplier_df["LibelleColA"].apply(is_opening_balance_row)
+        )
+    else:  # coala
+        opening_mask = supplier_df["LibelleColA"].apply(is_opening_balance_row)
+
+    # --- Fonction d'allocation lettrée (varie selon le format) ---
+    # Pour "mixed" et "pennyland" : matching par montant (avec fallback FIFO intégré)
+    _alloc_lettered = allocate_fifo if gl_format == "coala" else allocate_amount_match
 
     # ============================================================
     # 1) FACTURES LETTRÉES / PAIEMENTS LETTRÉS
@@ -278,6 +470,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
+        & (~opening_mask)                                  # exclure Report à nouveau (AA)
         & _invoice_year_ok(supplier_df["DateOperation"])
     ].copy()
 
@@ -345,7 +538,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             inv_group = inv_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
             pay_group = pay_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-            allocations, _ = allocate_fifo(inv_group, pay_group)
+            allocations, _ = _alloc_lettered(inv_group, pay_group)
 
             for alloc in allocations:
                 inv = alloc["invoice_row"]
@@ -356,6 +549,33 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 invoice_date = inv["DateOperation"]
                 payment_date = pay["DateOperation"]
 
+                # ── Paiement APRÈS la date de clôture (31/12/N) ──────────────────
+                # La facture est considérée NON PAYÉE à la clôture.
+                # Délai = 31/12/N − date_facture + 1
+                if pd.notna(payment_date) and payment_date > reference_date:
+                    clot_delay = (
+                        None if pd.isna(invoice_date)
+                        else int((reference_date - invoice_date).days + 1)
+                    )
+                    unpaid_rows.append({
+                        "Code fournisseur": boundary.supplier_code,
+                        "Nom fournisseur": boundary.supplier_name,
+                        "Libellé": inv["LibelleColE"],
+                        "Numero facture": inv["NumeroFacture"],
+                        "Type": "Facture non payée (paiement après clôture)",
+                        "Journal": inv["JournalColC"],
+                        "Lettrage": letter,
+                        "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                        "Date paiement": None,
+                        "Montant facture": round(allocated_amount, 2),
+                        "Montant(s) paiement(s) total": 0.0,
+                        "Montant facture origine": round(invoice_total, 2),
+                        "Délai (jours)": clot_delay,
+                        "Remarque": classify_remark(clot_delay),
+                        "Ligne source facture": int(inv["original_row"]) + 2,
+                    })
+                    continue  # ne pas ajouter aux paid_rows
+                # ── Paiement dans l'année (ou date invalide) ─────────────────────
                 if pd.isna(invoice_date) or pd.isna(payment_date):
                     delay_days = None
                     remark = "Date facture ou date paiement invalide"
@@ -388,19 +608,21 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] == "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
-        & (~supplier_df["LibelleColA"].apply(is_opening_balance_row))
+        & (~opening_mask)
         & _invoice_year_ok(supplier_df["DateOperation"])
     ].copy()
 
     unpaid_invoices = unpaid_invoices.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-    opening_rows = supplier_df[supplier_df["LibelleColA"].apply(is_opening_balance_row)].copy()
+    opening_rows = supplier_df[opening_mask].copy()
     opening_advance_amount = round(opening_rows["Debit"].sum(), 2)
 
     unlettered_payments = supplier_df[
         (supplier_df["Debit"] > 0)
         & (supplier_df["Lettrage"] == "")
-        & (~supplier_df["LibelleColA"].apply(is_opening_balance_row))
+        & (~opening_mask)
+        # Exclure les paiements postérieurs à la date de clôture
+        & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
 
     unlettered_payments = unlettered_payments.sort_values(by=["DateOperation", "original_row"], na_position="last")
@@ -570,13 +792,25 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     return paid_rows, unpaid_rows
 
 
-def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter: int = None):
+def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                        year_filter: int = None, gl_format: str = "coala"):
     """Calcule la ligne de contrôle pour un fournisseur.
     year_filter : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
+    gl_format   : détection du solde d'ouverture adaptée au format.
     """
+    if gl_format == "pennyland":
+        opening_excl = supplier_df["JournalColC"].str.upper() == "AA"
+    elif gl_format == "mixed":
+        opening_excl = (
+            (supplier_df["JournalColC"].str.upper() == "AA")
+            | supplier_df["LibelleColE"].apply(is_opening_balance_row)
+        )
+    else:  # coala
+        opening_excl = supplier_df["LibelleColE"].apply(is_opening_balance_row)
+
     mask = (
         (supplier_df["Credit"] > 0)
-        & (~supplier_df["LibelleColE"].apply(is_opening_balance_row))
+        & (~opening_excl)
     )
     if year_filter is not None:
         mask = mask & (supplier_df["DateOperation"].dt.year == year_filter)
@@ -711,6 +945,169 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
     return _finalize_results(all_paid, all_unpaid, control_rows)
 
 
+def process_workbook_pennyland(uploaded_file, sheet_name,
+                                reference_date: pd.Timestamp, opening_date: pd.Timestamp):
+    """Traitement GL Pennyland – mode Année civile."""
+    # header=1 : saute la 1ère ligne vide de l'export Pennyland et utilise la 2ème comme en-tête
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+
+    if df.shape[1] < 12:
+        raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
+
+    suppliers = find_supplier_boundaries_pennyland(df)
+    if not suppliers:
+        raise ValueError("Aucun fournisseur détecté dans le fichier GL Pennyland.")
+
+    all_paid     = []
+    all_unpaid   = []
+    control_rows = []
+    year         = reference_date.year
+
+    for boundary in suppliers:
+        supplier_df = prepare_supplier_data_pennyland(df, boundary)
+        paid_rows, unpaid_rows = process_supplier(
+            boundary, supplier_df, reference_date, opening_date,
+            mode="civile", year_filter=year, gl_format="pennyland"
+        )
+        paid_rows   = _filter_by_year(paid_rows,   year)
+        unpaid_rows = _filter_by_year(unpaid_rows, year)
+
+        all_paid.extend(paid_rows)
+        all_unpaid.extend(unpaid_rows)
+        control_rows.append(
+            _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                               year_filter=year, gl_format="pennyland")
+        )
+
+    return _finalize_results(all_paid, all_unpaid, control_rows)
+
+
+def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
+    """Lit un fichier Excel selon le format GL et retourne (df, find_boundaries_fn, prepare_fn)."""
+    if gl_format == "pennyland":
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+        if df.shape[1] < 12:
+            raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
+        return df, find_supplier_boundaries_pennyland, prepare_supplier_data_pennyland
+    else:  # coala
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
+        if df.shape[1] < 8:
+            raise ValueError("Le fichier GL COALA doit contenir au minimum 8 colonnes (A à H).")
+        return df, find_supplier_boundaries, prepare_supplier_data
+
+
+def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
+                              reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                              row_offset: int = 0):
+    """Traite un seul fichier en mode cheval (année civile avec filtre + règle paiement post-clôture).
+    Utilisé pour le mode MIXED où les deux fichiers ont des formats différents.
+    """
+    suppliers = find_fn(df)
+    year       = reference_date.year
+    all_paid, all_unpaid, ctrl = [], [], []
+
+    for boundary in suppliers:
+        supplier_df = prep_fn(df, boundary, row_offset=row_offset)
+        paid_rows, unpaid_rows = process_supplier(
+            boundary, supplier_df, reference_date, opening_date,
+            mode="civile", year_filter=year, gl_format=gl_fmt
+        )
+        paid_rows   = _filter_by_year(paid_rows,   year)
+        unpaid_rows = _filter_by_year(unpaid_rows, year)
+        all_paid.extend(paid_rows)
+        all_unpaid.extend(unpaid_rows)
+        ctrl.append(
+            _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                               year_filter=year, gl_format=gl_fmt)
+        )
+    return all_paid, all_unpaid, ctrl
+
+
+def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
+                                     file2, sheet2, gl_format2: str,
+                                     reference_date: pd.Timestamp, opening_date: pd.Timestamp):
+    """Traitement Année à cheval générique : chaque fichier peut être COALA ou PENNYLAND.
+
+    • Même format (COALA+COALA ou PENNYLAND+PENNYLAND) :
+      appariement fournisseurs par code, détection croisée lettrage inter-années.
+
+    • Formats différents (COALA+PENNYLAND ou PENNYLAND+COALA) :
+      les systèmes de lettrage sont incompatibles → chaque fichier est traité
+      indépendamment avec filtre sur l'année choisie. Les résultats sont fusionnés.
+    """
+    df1, find_fn1, prep_fn1 = _read_file_by_format(file1, sheet1, gl_format1)
+    df2, find_fn2, prep_fn2 = _read_file_by_format(file2, sheet2, gl_format2)
+
+    # ── Formats identiques : appariement inter-années ────────────────────────
+    if gl_format1 == gl_format2:
+        suppliers1 = find_fn1(df1)
+        suppliers2 = find_fn2(df2)
+
+        if not suppliers1 and not suppliers2:
+            raise ValueError("Aucun fournisseur détecté dans les deux fichiers.")
+
+        map1 = {b.supplier_code: b for b in suppliers1}
+        map2 = {b.supplier_code: b for b in suppliers2}
+        all_codes = sorted(set(map1.keys()) | set(map2.keys()))
+
+        row_offset_file2 = len(df1) + 10000
+        combined_gl_format = gl_format1
+
+        all_paid, all_unpaid, control_rows = [], [], []
+        year        = reference_date.year
+        valid_years = {year}
+
+        for code in all_codes:
+            b1 = map1.get(code)
+            b2 = map2.get(code)
+            boundary = b1 if b1 else b2
+
+            parts = []
+            if b1:
+                df_s1 = prep_fn1(df1, b1, row_offset=0)
+                df_s1["source_file"] = 1
+                parts.append(df_s1)
+            if b2:
+                df_s2 = prep_fn2(df2, b2, row_offset=row_offset_file2)
+                df_s2["source_file"] = 2
+                parts.append(df_s2)
+
+            supplier_df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+
+            paid_rows, unpaid_rows = process_supplier(
+                boundary, supplier_df, reference_date, opening_date,
+                mode="cheval", year_filter=None, gl_format=combined_gl_format
+            )
+            paid_rows   = _filter_by_year(paid_rows,   valid_years)
+            unpaid_rows = _filter_by_year(unpaid_rows, valid_years)
+
+            all_paid.extend(paid_rows)
+            all_unpaid.extend(unpaid_rows)
+            control_rows.append(
+                _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                                   year_filter=year, gl_format=combined_gl_format)
+            )
+
+        return _finalize_results(all_paid, all_unpaid, control_rows)
+
+    # ── Formats différents (MIXED) : traitement indépendant par fichier ──────
+    # Les lettrages COALA et PENNYLAND sont dans des systèmes distincts et ne
+    # peuvent pas être mis en correspondance inter-fichiers.
+    # Chaque fichier est traité séparément en mode civile + filtre année N.
+    paid1, unpaid1, ctrl1 = _process_one_file_cheval(
+        df1, find_fn1, prep_fn1, gl_format1, reference_date, opening_date, row_offset=0
+    )
+    paid2, unpaid2, ctrl2 = _process_one_file_cheval(
+        df2, find_fn2, prep_fn2, gl_format2, reference_date, opening_date,
+        row_offset=len(df1) + 10000
+    )
+
+    if not paid1 and not unpaid1 and not paid2 and not unpaid2:
+        raise ValueError("Aucune facture de l'année choisie trouvée dans les deux fichiers.")
+
+    return _finalize_results(paid1 + paid2, unpaid1 + unpaid2, ctrl1 + ctrl2)
+
+
 def _finalize_results(all_paid, all_unpaid, control_rows):
     paid_df = pd.DataFrame(all_paid)
     unpaid_df = pd.DataFrame(all_unpaid)
@@ -754,9 +1151,11 @@ def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
 # ============================================================
 
 with st.expander("Format attendu du fichier Excel", expanded=False):
-    st.markdown(
-        """
-- **Colonne A** : début/fin fournisseur
+    tab_coala, tab_pennyland = st.tabs(["GL COALA", "GL PENNYLAND"])
+    with tab_coala:
+        st.markdown(
+            """
+- **Colonne A** : début/fin fournisseur (ligne avec code « 9XXXX Nom »)
 - **Colonne B** : date
 - **Colonne C** : journal
 - **Colonne D** : pièce
@@ -765,13 +1164,25 @@ with st.expander("Format attendu du fichier Excel", expanded=False):
 - **Colonne G** : crédit
 - **Colonne H** : lettrage
 
-**Règles importantes :**
-- Les **factures** sont prises seulement si le **journal colonne C commence par `A`**
-- Si la **Pièce D** ressemble à un code interne type `AC25080025` ou `BQ425010004`, on cherche le numéro dans le **Libellé E**
-- Les paiements non lettrés sont imputés en **FIFO** sur les factures non lettrées du même fournisseur
-- En mode **Année à cheval** : un paiement lettré avec une facture d'une autre année est ignoré ; la facture est traitée comme non payée
+**Règles :** Factures = journal col C commence par `A` · Paiements non lettrés imputés en FIFO
 """
-    )
+        )
+    with tab_pennyland:
+        st.markdown(
+            """
+- **Colonne A (N° de compte)** : code fournisseur – chaque compte = un fournisseur
+- **Colonne B (Libellé de compte)** : nom du fournisseur
+- **Colonne C (Date)** : date de la transaction
+- **Colonne D (Journal)** : `AC` = facture · `BQ*` = paiement · `AA` = Report à nouveau (exclu)
+- **Colonne E (Libellé de pièce)** : libellé
+- **Colonne H (N° de facture)** : numéro de facture direct
+- **Colonne J (Let.)** : lettrage
+- **Colonne K (Débit)** / **Colonne L (Crédit)**
+
+**Règles :** Factures = Crédit col L + journal commence par `A` (hors `AA`) ·
+Paiements lettrés → matching par montant identique · Paiements non lettrés → FIFO
+"""
+        )
 
 st.divider()
 
@@ -789,11 +1200,34 @@ with col_m:
     )
 
 reference_date = pd.Timestamp(f"{int(selected_year)}-12-31")
-opening_date = pd.Timestamp(f"{int(selected_year)}-01-01")
+opening_date   = pd.Timestamp(f"{int(selected_year)}-01-01")
 
 st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date d'ouverture : **{opening_date.date()}**")
 
 st.divider()
+
+GL_OPTIONS = ["GL COALA", "GL PENNYLAND"]
+
+def _gl_label_to_format(label: str) -> str:
+    return "pennyland" if label == "GL PENNYLAND" else "coala"
+
+def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = ""):
+    st.success("Traitement terminé avec succès.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Lignes payées", len(paid_df))
+    c2.metric("Lignes non payées", len(unpaid_df))
+    c3.metric("Total lignes résultat", len(result_df))
+    st.subheader("Résultat global")
+    st.dataframe(result_df, use_container_width=True)
+    st.subheader("Contrôle fournisseurs détectés")
+    st.dataframe(control_df, use_container_width=True)
+    excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
+    st.download_button(
+        label="Télécharger le fichier résultat",
+        data=excel_bytes,
+        file_name=f"resultat_delai_paiement_{year}{suffix}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 is_cheval = exercise_mode.startswith("Année à cheval")
 
@@ -801,9 +1235,14 @@ is_cheval = exercise_mode.startswith("Année à cheval")
 # MODE ANNÉE CIVILE
 # ============================================================
 if not is_cheval:
-    uploaded_file = st.file_uploader(
-        "Importer le grand livre fournisseurs (Excel)", type=["xlsx", "xls"]
-    )
+    col_fmt, col_file = st.columns([1, 3])
+    with col_fmt:
+        gl_fmt_label = st.radio("Format du grand livre", GL_OPTIONS, key="fmt_civile")
+    with col_file:
+        uploaded_file = st.file_uploader(
+            f"Grand livre fournisseurs ({gl_fmt_label}) — Excel",
+            type=["xlsx", "xls"], key="up_civile"
+        )
 
     if uploaded_file is not None:
         try:
@@ -818,35 +1257,20 @@ if not is_cheval:
         if st.button("Lancer le traitement", type="primary"):
             try:
                 uploaded_file.seek(0)
-                result_df, paid_df, unpaid_df, control_df = process_workbook(
-                    uploaded_file, selected_sheet, reference_date, opening_date
-                )
-
-                st.success("Traitement terminé avec succès.")
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Lignes payées", len(paid_df))
-                c2.metric("Lignes non payées", len(unpaid_df))
-                c3.metric("Total lignes résultat", len(result_df))
-
-                st.subheader("Résultat global")
-                st.dataframe(result_df, use_container_width=True)
-
-                st.subheader("Contrôle fournisseurs détectés")
-                st.dataframe(control_df, use_container_width=True)
-
-                excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
-                st.download_button(
-                    label="Télécharger le fichier résultat",
-                    data=excel_bytes,
-                    file_name=f"resultat_delai_paiement_{int(selected_year)}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
+                gl_fmt = _gl_label_to_format(gl_fmt_label)
+                if gl_fmt == "pennyland":
+                    result_df, paid_df, unpaid_df, control_df = process_workbook_pennyland(
+                        uploaded_file, selected_sheet, reference_date, opening_date
+                    )
+                else:
+                    result_df, paid_df, unpaid_df, control_df = process_workbook(
+                        uploaded_file, selected_sheet, reference_date, opening_date
+                    )
+                _show_results(result_df, paid_df, unpaid_df, control_df, int(selected_year))
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
-        st.info("Chargez un fichier Excel pour démarrer le traitement.")
+        st.info("Choisissez le format du grand livre puis chargez le fichier Excel.")
 
 # ============================================================
 # MODE ANNÉE À CHEVAL
@@ -854,82 +1278,67 @@ if not is_cheval:
 else:
     st.info(
         f"**Année à cheval** : chargez les deux grands livres. "
-        f"Les paiements lettrés avec des factures d'une autre période seront ignorés. "
-        f"Date de clôture : **31/12/{int(selected_year)}**."
+        f"Seules les factures de **{int(selected_year)}** apparaîtront. "
+        f"Clôture : **31/12/{int(selected_year)}**. "
+        f"Chaque fichier peut avoir son propre format (COALA ou PENNYLAND)."
     )
 
     col_f1, col_f2 = st.columns(2)
 
     with col_f1:
-        st.markdown(f"**Grand livre — Année {int(selected_year) - 1}**")
+        st.markdown(f"#### Grand livre — Année {int(selected_year) - 1}")
+        gl_fmt1_label = st.radio("Format GL (fichier N-1)", GL_OPTIONS, key="fmt1")
         file1 = st.file_uploader(
-            f"Fichier grand livre {int(selected_year) - 1}",
-            type=["xlsx", "xls"],
-            key="file1",
+            f"Fichier {int(selected_year) - 1} ({gl_fmt1_label})",
+            type=["xlsx", "xls"], key="file1",
         )
         sheet1 = None
         if file1 is not None:
             try:
-                xl1 = pd.ExcelFile(file1)
+                xl1   = pd.ExcelFile(file1)
                 sheet1 = st.selectbox(
-                    f"Feuille du fichier {int(selected_year) - 1}",
-                    xl1.sheet_names,
-                    key="sheet1",
+                    f"Feuille — fichier {int(selected_year) - 1}",
+                    xl1.sheet_names, key="sheet1",
                 )
             except Exception as e:
-                st.error(f"Impossible de lire le fichier 1 : {e}")
+                st.error(f"Impossible de lire le fichier N-1 : {e}")
 
     with col_f2:
-        st.markdown(f"**Grand livre — Année {int(selected_year)}**")
+        st.markdown(f"#### Grand livre — Année {int(selected_year)}")
+        gl_fmt2_label = st.radio("Format GL (fichier N)", GL_OPTIONS, key="fmt2")
         file2 = st.file_uploader(
-            f"Fichier grand livre {int(selected_year)}",
-            type=["xlsx", "xls"],
-            key="file2",
+            f"Fichier {int(selected_year)} ({gl_fmt2_label})",
+            type=["xlsx", "xls"], key="file2",
         )
         sheet2 = None
         if file2 is not None:
             try:
-                xl2 = pd.ExcelFile(file2)
+                xl2   = pd.ExcelFile(file2)
                 sheet2 = st.selectbox(
-                    f"Feuille du fichier {int(selected_year)}",
-                    xl2.sheet_names,
-                    key="sheet2",
+                    f"Feuille — fichier {int(selected_year)}",
+                    xl2.sheet_names, key="sheet2",
                 )
             except Exception as e:
-                st.error(f"Impossible de lire le fichier 2 : {e}")
+                st.error(f"Impossible de lire le fichier N : {e}")
 
-    both_ready = file1 is not None and file2 is not None and sheet1 is not None and sheet2 is not None
+    both_ready = (
+        file1 is not None and file2 is not None
+        and sheet1 is not None and sheet2 is not None
+    )
 
     if both_ready:
-        if st.button("Lancer le traitement à cheval", type="primary"):
+        fmt_combo = f"{gl_fmt1_label} + {gl_fmt2_label}"
+        if st.button(f"Lancer le traitement à cheval ({fmt_combo})", type="primary"):
             try:
                 file1.seek(0)
                 file2.seek(0)
-                result_df, paid_df, unpaid_df, control_df = process_workbook_cheval(
-                    file1, sheet1, file2, sheet2, reference_date, opening_date
+                result_df, paid_df, unpaid_df, control_df = process_workbook_cheval_generic(
+                    file1, sheet1, _gl_label_to_format(gl_fmt1_label),
+                    file2, sheet2, _gl_label_to_format(gl_fmt2_label),
+                    reference_date, opening_date
                 )
-
-                st.success("Traitement terminé avec succès.")
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Lignes payées", len(paid_df))
-                c2.metric("Lignes non payées", len(unpaid_df))
-                c3.metric("Total lignes résultat", len(result_df))
-
-                st.subheader("Résultat global")
-                st.dataframe(result_df, use_container_width=True)
-
-                st.subheader("Contrôle fournisseurs détectés")
-                st.dataframe(control_df, use_container_width=True)
-
-                excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
-                st.download_button(
-                    label="Télécharger le fichier résultat",
-                    data=excel_bytes,
-                    file_name=f"resultat_delai_paiement_cheval_{int(selected_year)}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
+                _show_results(result_df, paid_df, unpaid_df, control_df,
+                              int(selected_year), suffix="_cheval")
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
