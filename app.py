@@ -1,4 +1,4 @@
-﻿import io
+import io
 import re
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -7,21 +7,18 @@ import pandas as pd
 import streamlit as st
 
 
-REFERENCE_DATE = pd.Timestamp("2025-12-31")
-OPENING_DATE = pd.Timestamp("2025-01-01")
-
 st.set_page_config(page_title="Déclarations délai de paiement", layout="wide")
 st.title("Application de traitement des déclarations de délai de paiement")
 
 EXPECTED_COL_INDEX = {
-    "col_a": 0,    # A
-    "date": 1,     # B
-    "journal": 2,  # C
-    "piece": 3,    # D
-    "libelle": 4,  # E
-    "debit": 5,    # F
-    "credit": 6,   # G
-    "lettrage": 7  # H
+    "col_a": 0,
+    "date": 1,
+    "journal": 2,
+    "piece": 3,
+    "libelle": 4,
+    "debit": 5,
+    "credit": 6,
+    "lettrage": 7
 }
 
 
@@ -80,8 +77,9 @@ def is_supplier_total(cell_value: str) -> bool:
 
 
 def is_opening_balance_row(text: str) -> bool:
+    """Détecte une ligne solde d'ouverture : 'Total au JJ/MM/AAAA'."""
     t = normalize_text(text).lower().replace(" ", "")
-    return t.startswith("totalau01/01/2025") or t.startswith("totalau1/1/2025")
+    return bool(re.match(r"totalau\d{1,2}/\d{1,2}/\d{2,4}", t))
 
 
 def classify_remark(delay_days):
@@ -92,7 +90,7 @@ def classify_remark(delay_days):
     if delay_days <= 60:
         return "Rien à signaler"
     if 61 <= delay_days <= 120:
-        return "Demander la convention de délai de paiement du fournisseur en cas d’existence, sinon pénalité"
+        return "Demander la convention de délai de paiement du fournisseur en cas d'existence, sinon pénalité"
     return "Pénalité à payer"
 
 
@@ -100,12 +98,8 @@ def is_internal_piece_reference(piece_text: str) -> bool:
     t = normalize_text(piece_text).upper().replace(" ", "")
     if not t:
         return False
-
-    # Cas à exclure : 2 lettres + chiffres uniquement
-    # Exemples : AC25080025 / BQ425010004
     if len(t) >= 8 and t[:2].isalpha() and t[2:].isdigit():
         return True
-
     return False
 
 
@@ -134,19 +128,15 @@ def extract_invoice_number(piece_text: str, libelle_text: str) -> str:
     piece = normalize_text(piece_text)
     libelle = normalize_text(libelle_text)
 
-    # Si D ressemble à un code interne type AC25080025 ou BQ425010004,
-    # on ignore D et on cherche le numéro dans E.
     if piece and is_internal_piece_reference(piece):
         extracted = extract_invoice_from_libelle(libelle)
         if extracted:
             return extracted
         return libelle
 
-    # Sinon on garde D
     if piece:
         return piece
 
-    # Si D est vide, on tente dans E
     extracted = extract_invoice_from_libelle(libelle)
     if extracted:
         return extracted
@@ -182,9 +172,10 @@ def find_supplier_boundaries(df: pd.DataFrame) -> List[SupplierBoundary]:
     return suppliers
 
 
-def prepare_supplier_data(df: pd.DataFrame, boundary: SupplierBoundary) -> pd.DataFrame:
+def prepare_supplier_data(df: pd.DataFrame, boundary: SupplierBoundary, row_offset: int = 0) -> pd.DataFrame:
     supplier_df = df.iloc[boundary.start_row + 1: boundary.end_row].copy()
     supplier_df = supplier_df.reset_index(drop=False).rename(columns={"index": "original_row"})
+    supplier_df["original_row"] = supplier_df["original_row"] + row_offset
 
     supplier_df["DateOperation"] = supplier_df.iloc[:, EXPECTED_COL_INDEX["date"] + 1].apply(safe_date)
     supplier_df["JournalColC"] = supplier_df.iloc[:, EXPECTED_COL_INDEX["journal"] + 1].apply(normalize_text)
@@ -267,17 +258,27 @@ def allocate_fifo(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
     return allocations, residuals
 
 
-def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
+def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
+                     reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                     mode: str = "civile", year_filter: Optional[int] = None):
     paid_rows = []
     unpaid_rows = []
+
+    has_source_file = "source_file" in supplier_df.columns
 
     # ============================================================
     # 1) FACTURES LETTRÉES / PAIEMENTS LETTRÉS
     # ============================================================
+    def _invoice_year_ok(s):
+        if year_filter is None:
+            return pd.Series([True] * len(s), index=s.index)
+        return s.dt.year == year_filter
+
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
+        & _invoice_year_ok(supplier_df["DateOperation"])
     ].copy()
 
     payments_lettered = supplier_df[
@@ -292,6 +293,54 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
 
             if pay_group.empty:
                 continue
+
+            # ---- MODE À CHEVAL : gestion des paiements cross-année ----
+            if mode == "cheval" and has_source_file:
+                inv_files = set(inv_group["source_file"].unique())
+                pay_group_same = pay_group[pay_group["source_file"].isin(inv_files)].copy()
+
+                if pay_group_same.empty:
+                    # Pas de paiement de la même année que la facture
+                    # Vérifier s'il existe un paiement de l'année N-1 (fichier antérieur)
+                    min_inv_file = min(inv_files)
+                    pay_group_prev = pay_group[pay_group["source_file"] < min_inv_file].copy()
+
+                    if not pay_group_prev.empty:
+                        # Paiement de l'année N-1 : facture payée EN AVANCE
+                        # Le délai sera négatif → classify_remark → "Rien à signaler"
+                        pay_group = pay_group_prev
+                        # On continue vers l'allocation FIFO normale ci-dessous
+                    else:
+                        # Aucun paiement trouvé dans les fichiers N-1 et N
+                        # → le paiement est de l'année N+1 : facture non payée à la clôture
+                        for _, inv in inv_group.iterrows():
+                            invoice_date = inv["DateOperation"]
+                            invoice_total = round(inv["Credit"], 2)
+                            delay_days = (
+                                None if pd.isna(invoice_date)
+                                else int((reference_date - invoice_date).days + 1)
+                            )
+                            unpaid_rows.append({
+                                "Code fournisseur": boundary.supplier_code,
+                                "Nom fournisseur": boundary.supplier_name,
+                                "Libellé": inv["LibelleColE"],
+                                "Numero facture": inv["NumeroFacture"],
+                                "Type": "Facture non payée (paiement année suivante)",
+                                "Journal": inv["JournalColC"],
+                                "Lettrage": letter,
+                                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
+                                "Date paiement": None,
+                                "Montant facture": invoice_total,
+                                "Montant(s) paiement(s) total": 0.0,
+                                "Montant facture origine": invoice_total,
+                                "Délai (jours)": delay_days,
+                                "Remarque": classify_remark(delay_days),
+                                "Ligne source facture": int(inv["original_row"]) + 2,
+                            })
+                        continue
+                else:
+                    pay_group = pay_group_same
+            # ---- FIN MODE À CHEVAL ----
 
             inv_group = inv_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
             pay_group = pay_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
@@ -340,15 +389,14 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
         & (supplier_df["Lettrage"] == "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
         & (~supplier_df["LibelleColA"].apply(is_opening_balance_row))
+        & _invoice_year_ok(supplier_df["DateOperation"])
     ].copy()
 
     unpaid_invoices = unpaid_invoices.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-    # Lignes d'ouverture : "Total au 01/01/2025" au débit = avance
     opening_rows = supplier_df[supplier_df["LibelleColA"].apply(is_opening_balance_row)].copy()
     opening_advance_amount = round(opening_rows["Debit"].sum(), 2)
 
-    # Paiements non lettrés réels
     unlettered_payments = supplier_df[
         (supplier_df["Debit"] > 0)
         & (supplier_df["Lettrage"] == "")
@@ -357,10 +405,10 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
 
     unlettered_payments = unlettered_payments.sort_values(by=["DateOperation", "original_row"], na_position="last")
 
-    # 2A) Imputation de l'avance d'ouverture au 01/01/2025
+    # 2A) Imputation de l'avance d'ouverture
     if not unpaid_invoices.empty and opening_advance_amount > 0:
         pseudo_opening_payment = pd.DataFrame([{
-            "DateOperation": OPENING_DATE,
+            "DateOperation": opening_date,
             "Debit": opening_advance_amount,
             "original_row": -1
         }])
@@ -378,7 +426,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
             if pd.isna(invoice_date):
                 delay_days = None
             else:
-                delay_days = int((OPENING_DATE - invoice_date).days + 1)
+                delay_days = int((opening_date - invoice_date).days + 1)
 
             unpaid_rows.append({
                 "Code fournisseur": boundary.supplier_code,
@@ -389,7 +437,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
                 "Journal": inv["JournalColC"],
                 "Lettrage": "",
                 "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-                "Date paiement": OPENING_DATE.date(),
+                "Date paiement": opening_date.date(),
                 "Montant facture": round(allocated_amount, 2),
                 "Montant(s) paiement(s) total": round(allocated_amount, 2),
                 "Montant facture origine": round(invoice_total, 2),
@@ -400,19 +448,16 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
 
             consumed_invoice_ids.add(int(inv["original_row"]))
 
-        remaining_invoice_rows = []
         residual_map = {}
 
         for res in opening_residuals:
             inv = res["invoice_row"]
             residual_map[int(inv["original_row"])] = round(res["remaining_amount"], 2)
-            remaining_invoice_rows.append(inv)
 
         for _, inv in unpaid_invoices.iterrows():
             key = int(inv["original_row"])
             if key not in residual_map and key not in consumed_invoice_ids:
                 residual_map[key] = round(inv["Credit"], 2)
-                remaining_invoice_rows.append(inv)
 
         unpaid_working = unpaid_invoices.copy()
         unpaid_working["RemainingAfterOpening"] = unpaid_working["original_row"].apply(
@@ -471,7 +516,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
             if pd.isna(invoice_date):
                 delay_days = None
             else:
-                delay_days = int((REFERENCE_DATE - invoice_date).days + 1)
+                delay_days = int((reference_date - invoice_date).days + 1)
 
             unpaid_rows.append({
                 "Code fournisseur": boundary.supplier_code,
@@ -492,7 +537,6 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
             })
 
     else:
-        # Aucun paiement non lettré ou aucune facture non lettrée => rester sur la logique "non payée"
         for _, inv in unpaid_working.iterrows():
             invoice_date = inv["DateOperation"]
             remaining_amount = round(inv["Credit"], 2)
@@ -503,7 +547,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
             if pd.isna(invoice_date):
                 delay_days = None
             else:
-                delay_days = int((REFERENCE_DATE - invoice_date).days + 1)
+                delay_days = int((reference_date - invoice_date).days + 1)
 
             unpaid_rows.append({
                 "Code fournisseur": boundary.supplier_code,
@@ -526,89 +570,148 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame):
     return paid_rows, unpaid_rows
 
 
-def process_workbook(uploaded_file, sheet_name=None):
-    if sheet_name:
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
-    else:
-        df = pd.read_excel(uploaded_file, header=0)
+def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter: int = None):
+    """Calcule la ligne de contrôle pour un fournisseur.
+    year_filter : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
+    """
+    mask = (
+        (supplier_df["Credit"] > 0)
+        & (~supplier_df["LibelleColE"].apply(is_opening_balance_row))
+    )
+    if year_filter is not None:
+        mask = mask & (supplier_df["DateOperation"].dt.year == year_filter)
+
+    total_credit_source = round(supplier_df.loc[mask, "Credit"].sum(), 2)
+
+    all_rows = paid_rows + unpaid_rows
+    factures_reconstituees = {}
+    for r in all_rows:
+        key = (r.get("Code fournisseur"), r.get("Numero facture"))
+        factures_reconstituees[key] = factures_reconstituees.get(key, 0.0) + float(r.get("Montant facture", 0) or 0)
+
+    total_factures_retenues = round(sum(factures_reconstituees.values()), 2)
+    ecart = round(total_credit_source - total_factures_retenues, 2)
+
+    return {
+        "Code fournisseur": boundary.supplier_code,
+        "Nom fournisseur": boundary.supplier_name,
+        "Nb lignes payées": len(paid_rows),
+        "Nb lignes non payées": len(unpaid_rows),
+        "Total crédit source": total_credit_source,
+        "Total factures retenues": total_factures_retenues,
+        "Écart": ecart,
+        "Statut contrôle": "OK" if abs(ecart) < 0.01 else "Écart à analyser",
+    }
+
+
+def _filter_by_year(rows: list, valid_years) -> list:
+    """Garde uniquement les lignes dont la date facture est dans les années valides.
+    valid_years peut être un int (une seule année) ou un set d'années.
+    Les lignes sans date (None) sont conservées.
+    """
+    if isinstance(valid_years, int):
+        valid_years = {valid_years}
+    result = []
+    for r in rows:
+        d = r.get("Date facture")
+        if d is None or d.year in valid_years:
+            result.append(r)
+    return result
+
+
+def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, opening_date: pd.Timestamp):
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
 
     if df.shape[1] < 8:
-        raise ValueError("Le fichier doit contenir au minimum 8 colonnes (A ? H).")
+        raise ValueError("Le fichier doit contenir au minimum 8 colonnes (A à H).")
 
     suppliers = find_supplier_boundaries(df)
     if not suppliers:
-        raise ValueError("Aucun fournisseur d?tect? dans la colonne A.")
+        raise ValueError("Aucun fournisseur détecté dans la colonne A.")
+
+    all_paid = []
+    all_unpaid = []
+    control_rows = []
+    year = reference_date.year
+
+    for boundary in suppliers:
+        supplier_df = prepare_supplier_data(df, boundary)
+        paid_rows, unpaid_rows = process_supplier(boundary, supplier_df, reference_date, opening_date, mode="civile", year_filter=year)
+
+        # Filtre final : on ne garde que les factures de l'année choisie
+        paid_rows = _filter_by_year(paid_rows, year)
+        unpaid_rows = _filter_by_year(unpaid_rows, year)
+
+        all_paid.extend(paid_rows)
+        all_unpaid.extend(unpaid_rows)
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df))
+
+    return _finalize_results(all_paid, all_unpaid, control_rows)
+
+
+def process_workbook_cheval(file1, sheet1, file2, sheet2,
+                            reference_date: pd.Timestamp, opening_date: pd.Timestamp):
+    df1 = pd.read_excel(file1, sheet_name=sheet1, header=0)
+    df2 = pd.read_excel(file2, sheet_name=sheet2, header=0)
+
+    if df1.shape[1] < 8 or df2.shape[1] < 8:
+        raise ValueError("Les deux fichiers doivent contenir au minimum 8 colonnes (A à H).")
+
+    suppliers1 = find_supplier_boundaries(df1)
+    suppliers2 = find_supplier_boundaries(df2)
+
+    if not suppliers1 and not suppliers2:
+        raise ValueError("Aucun fournisseur détecté dans les deux fichiers.")
+
+    # Index par code fournisseur
+    map1 = {b.supplier_code: b for b in suppliers1}
+    map2 = {b.supplier_code: b for b in suppliers2}
+    all_codes = sorted(set(map1.keys()) | set(map2.keys()))
+
+    # Offset pour éviter collision d'index entre les deux fichiers
+    row_offset_file2 = len(df1) + 10000
 
     all_paid = []
     all_unpaid = []
     control_rows = []
 
-    for boundary in suppliers:
-        supplier_df = prepare_supplier_data(df, boundary)
-        paid_rows, unpaid_rows = process_supplier(boundary, supplier_df)
+    # Filtre : uniquement les factures de l'année choisie (N)
+    year = reference_date.year
+    valid_years = {year}
+
+    for code in all_codes:
+        b1 = map1.get(code)
+        b2 = map2.get(code)
+
+        # Récupérer le nom fournisseur (préférence au fichier 1)
+        boundary = b1 if b1 else b2
+
+        parts = []
+        if b1:
+            df_s1 = prepare_supplier_data(df1, b1, row_offset=0)
+            df_s1["source_file"] = 1
+            parts.append(df_s1)
+        if b2:
+            df_s2 = prepare_supplier_data(df2, b2, row_offset=row_offset_file2)
+            df_s2["source_file"] = 2
+            parts.append(df_s2)
+
+        supplier_df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+
+        paid_rows, unpaid_rows = process_supplier(boundary, supplier_df, reference_date, opening_date, mode="cheval", year_filter=None)
+
+        # Filtre final : uniquement les factures de l'année choisie
+        paid_rows = _filter_by_year(paid_rows, valid_years)
+        unpaid_rows = _filter_by_year(unpaid_rows, valid_years)
 
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter=year))
 
-        # IMPORTANT :
-        # Total cr?dit source = tous les cr?dits du fournisseur
-        # SAUF les lignes dont le libell? colonne E est exactement "Total au 01/01/2025"
-        total_credit_source = round(
-            supplier_df.loc[
-                (supplier_df["Credit"] > 0)
-                & (
-                    supplier_df["LibelleColE"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    != "total au 01/01/2025"
-                ),
-                "Credit"
-            ].sum(),
-            2
-        )
+    return _finalize_results(all_paid, all_unpaid, control_rows)
 
-                # Reconstitution exhaustive du total factures :
-        # on additionne toutes les fractions d'une m?me facture
-        # (pay?e, pay?e FIFO, non pay?e) pour retrouver son montant total
-        all_rows = paid_rows + unpaid_rows
 
-        factures_reconstituees = {}
-
-        for r in all_rows:
-            key = (
-                r.get("Code fournisseur"),
-                r.get("Numero facture"),
-            )
-
-            montant_ligne = float(r.get("Montant facture", 0) or 0)
-
-            if key not in factures_reconstituees:
-                factures_reconstituees[key] = 0.0
-
-            factures_reconstituees[key] += montant_ligne
-
-        total_factures_retenues = round(
-            sum(factures_reconstituees.values()),
-            2
-        )
-
-        ecart = round(total_credit_source - total_factures_retenues, 2)
-
-        control_rows.append({
-            "Code fournisseur": boundary.supplier_code,
-            "Nom fournisseur": boundary.supplier_name,
-            "Ligne d?but": boundary.start_row + 2,
-            "Ligne fin Total": boundary.end_row + 2,
-            "Nb lignes pay?es": len(paid_rows),
-            "Nb lignes non pay?es": len(unpaid_rows),
-            "Total cr?dit source": total_credit_source,
-            "Total factures retenues": total_factures_retenues,
-            "?cart": ecart,
-            "Statut contr?le": "OK" if abs(ecart) < 0.01 else "?cart ? analyser",
-        })
-
+def _finalize_results(all_paid, all_unpaid, control_rows):
     paid_df = pd.DataFrame(all_paid)
     unpaid_df = pd.DataFrame(all_unpaid)
     control_df = pd.DataFrame(control_rows)
@@ -623,7 +726,8 @@ def process_workbook(uploaded_file, sheet_name=None):
     return result_df, paid_df, unpaid_df, control_df
 
 
-def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame, unpaid_df: pd.DataFrame, control_df: pd.DataFrame) -> bytes:
+def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
+                   unpaid_df: pd.DataFrame, control_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         result_df.to_excel(writer, index=False, sheet_name="Resultat global")
@@ -645,6 +749,10 @@ def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame, unpaid_df: pd
     return output.getvalue()
 
 
+# ============================================================
+# INTERFACE UTILISATEUR
+# ============================================================
+
 with st.expander("Format attendu du fichier Excel", expanded=False):
     st.markdown(
         """
@@ -661,52 +769,168 @@ with st.expander("Format attendu du fichier Excel", expanded=False):
 - Les **factures** sont prises seulement si le **journal colonne C commence par `A`**
 - Si la **Pièce D** ressemble à un code interne type `AC25080025` ou `BQ425010004`, on cherche le numéro dans le **Libellé E**
 - Les paiements non lettrés sont imputés en **FIFO** sur les factures non lettrées du même fournisseur
+- En mode **Année à cheval** : un paiement lettré avec une facture d'une autre année est ignoré ; la facture est traitée comme non payée
 """
     )
 
-uploaded_file = st.file_uploader("Importer le grand livre fournisseurs (Excel)", type=["xlsx", "xls"])
+st.divider()
 
-if uploaded_file is not None:
-    try:
-        xl = pd.ExcelFile(uploaded_file)
-        sheet_options = xl.sheet_names
-    except Exception as e:
-        st.error(f"Impossible de lire le fichier Excel : {e}")
-        st.stop()
+# --- Sélection de l'année et du mode ---
+col_y, col_m = st.columns([1, 2])
+with col_y:
+    selected_year = st.number_input(
+        "Année d'exercice", min_value=2000, max_value=2100, value=2025, step=1
+    )
+with col_m:
+    exercise_mode = st.radio(
+        "Type d'exercice",
+        ["Année civile (Janvier → Décembre)", "Année à cheval (deux grands livres)"],
+        horizontal=True,
+    )
 
-    selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
+reference_date = pd.Timestamp(f"{int(selected_year)}-12-31")
+opening_date = pd.Timestamp(f"{int(selected_year)}-01-01")
 
-    if st.button("Lancer le traitement", type="primary"):
+st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date d'ouverture : **{opening_date.date()}**")
+
+st.divider()
+
+is_cheval = exercise_mode.startswith("Année à cheval")
+
+# ============================================================
+# MODE ANNÉE CIVILE
+# ============================================================
+if not is_cheval:
+    uploaded_file = st.file_uploader(
+        "Importer le grand livre fournisseurs (Excel)", type=["xlsx", "xls"]
+    )
+
+    if uploaded_file is not None:
         try:
-            uploaded_file.seek(0)
-            result_df, paid_df, unpaid_df, control_df = process_workbook(uploaded_file, selected_sheet)
-
-            st.success("Traitement terminé avec succès.")
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Lignes payées", len(paid_df))
-            c2.metric("Lignes non payées", len(unpaid_df))
-            c3.metric("Total lignes résultat", len(result_df))
-
-            st.subheader("Résultat global")
-            st.dataframe(result_df, use_container_width=True)
-
-            st.subheader("Contrôle fournisseurs détectés")
-            st.dataframe(control_df, use_container_width=True)
-
-            excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
-            st.download_button(
-                label="Télécharger le fichier résultat",
-                data=excel_bytes,
-                file_name="resultat_delai_paiement.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
+            xl = pd.ExcelFile(uploaded_file)
+            sheet_options = xl.sheet_names
         except Exception as e:
-            st.error(f"Erreur pendant le traitement : {e}")
+            st.error(f"Impossible de lire le fichier Excel : {e}")
+            st.stop()
+
+        selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
+
+        if st.button("Lancer le traitement", type="primary"):
+            try:
+                uploaded_file.seek(0)
+                result_df, paid_df, unpaid_df, control_df = process_workbook(
+                    uploaded_file, selected_sheet, reference_date, opening_date
+                )
+
+                st.success("Traitement terminé avec succès.")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Lignes payées", len(paid_df))
+                c2.metric("Lignes non payées", len(unpaid_df))
+                c3.metric("Total lignes résultat", len(result_df))
+
+                st.subheader("Résultat global")
+                st.dataframe(result_df, use_container_width=True)
+
+                st.subheader("Contrôle fournisseurs détectés")
+                st.dataframe(control_df, use_container_width=True)
+
+                excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
+                st.download_button(
+                    label="Télécharger le fichier résultat",
+                    data=excel_bytes,
+                    file_name=f"resultat_delai_paiement_{int(selected_year)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            except Exception as e:
+                st.error(f"Erreur pendant le traitement : {e}")
+    else:
+        st.info("Chargez un fichier Excel pour démarrer le traitement.")
+
+# ============================================================
+# MODE ANNÉE À CHEVAL
+# ============================================================
 else:
-    st.info("Chargez un fichier Excel pour démarrer le traitement.")
+    st.info(
+        f"**Année à cheval** : chargez les deux grands livres. "
+        f"Les paiements lettrés avec des factures d'une autre période seront ignorés. "
+        f"Date de clôture : **31/12/{int(selected_year)}**."
+    )
 
+    col_f1, col_f2 = st.columns(2)
 
+    with col_f1:
+        st.markdown(f"**Grand livre — Année {int(selected_year) - 1}**")
+        file1 = st.file_uploader(
+            f"Fichier grand livre {int(selected_year) - 1}",
+            type=["xlsx", "xls"],
+            key="file1",
+        )
+        sheet1 = None
+        if file1 is not None:
+            try:
+                xl1 = pd.ExcelFile(file1)
+                sheet1 = st.selectbox(
+                    f"Feuille du fichier {int(selected_year) - 1}",
+                    xl1.sheet_names,
+                    key="sheet1",
+                )
+            except Exception as e:
+                st.error(f"Impossible de lire le fichier 1 : {e}")
 
+    with col_f2:
+        st.markdown(f"**Grand livre — Année {int(selected_year)}**")
+        file2 = st.file_uploader(
+            f"Fichier grand livre {int(selected_year)}",
+            type=["xlsx", "xls"],
+            key="file2",
+        )
+        sheet2 = None
+        if file2 is not None:
+            try:
+                xl2 = pd.ExcelFile(file2)
+                sheet2 = st.selectbox(
+                    f"Feuille du fichier {int(selected_year)}",
+                    xl2.sheet_names,
+                    key="sheet2",
+                )
+            except Exception as e:
+                st.error(f"Impossible de lire le fichier 2 : {e}")
 
+    both_ready = file1 is not None and file2 is not None and sheet1 is not None and sheet2 is not None
+
+    if both_ready:
+        if st.button("Lancer le traitement à cheval", type="primary"):
+            try:
+                file1.seek(0)
+                file2.seek(0)
+                result_df, paid_df, unpaid_df, control_df = process_workbook_cheval(
+                    file1, sheet1, file2, sheet2, reference_date, opening_date
+                )
+
+                st.success("Traitement terminé avec succès.")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Lignes payées", len(paid_df))
+                c2.metric("Lignes non payées", len(unpaid_df))
+                c3.metric("Total lignes résultat", len(result_df))
+
+                st.subheader("Résultat global")
+                st.dataframe(result_df, use_container_width=True)
+
+                st.subheader("Contrôle fournisseurs détectés")
+                st.dataframe(control_df, use_container_width=True)
+
+                excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
+                st.download_button(
+                    label="Télécharger le fichier résultat",
+                    data=excel_bytes,
+                    file_name=f"resultat_delai_paiement_cheval_{int(selected_year)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            except Exception as e:
+                st.error(f"Erreur pendant le traitement : {e}")
+    else:
+        st.warning("Chargez les deux fichiers Excel pour activer le traitement.")
