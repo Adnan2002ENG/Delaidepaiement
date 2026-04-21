@@ -34,6 +34,18 @@ PENNYLAND_COL_INDEX = {
     "credit":      11,  # Crédit (col L)
 }
 
+# Colonnes GL SAGE (indices 0-basés, fichier lu avec header=1)
+SAGE_COL_INDEX = {
+    "compte":   0,  # A - N° COMPTE → code fournisseur (groupement par changement)
+    "date":     1,  # B - DATE
+    "journal":  2,  # C - CODE J
+    "piece":    3,  # D - N° DE PIECE
+    "libelle":  4,  # E - LIBELLE
+    "lettrage": 5,  # F - LETTRAGE
+    "debit":    6,  # G - DEBIT (paiement ou avoir)
+    "credit":   7,  # H - CREDIT (facture)
+}
+
 
 @dataclass
 class SupplierBoundary:
@@ -243,6 +255,81 @@ def prepare_supplier_data_pennyland(df: pd.DataFrame, boundary: SupplierBoundary
     return result
 
 
+def find_supplier_boundaries_sage(df: pd.DataFrame) -> List[SupplierBoundary]:
+    """Détecte les fournisseurs dans un GL SAGE.
+    Chaque groupe de lignes consécutives partageant le même N° COMPTE (col A) = un fournisseur.
+    Pas de nom fournisseur : chaque ligne garde son propre libellé / N° pièce.
+    """
+    suppliers = []
+    current_account = None
+    start_row = None
+
+    for idx in range(len(df)):
+        account = normalize_text(df.iat[idx, SAGE_COL_INDEX["compte"]])
+
+        if not account or account.lower() in ("nan", ""):
+            if current_account is not None:
+                suppliers.append(SupplierBoundary(
+                    supplier_code=current_account,
+                    supplier_name="",
+                    start_row=start_row,
+                    end_row=idx - 1,
+                ))
+                current_account = None
+                start_row = None
+            continue
+
+        if account != current_account:
+            if current_account is not None:
+                suppliers.append(SupplierBoundary(
+                    supplier_code=current_account,
+                    supplier_name="",
+                    start_row=start_row,
+                    end_row=idx - 1,
+                ))
+            current_account = account
+            start_row = idx
+
+    if current_account is not None:
+        suppliers.append(SupplierBoundary(
+            supplier_code=current_account,
+            supplier_name="",
+            start_row=start_row,
+            end_row=len(df) - 1,
+        ))
+
+    return suppliers
+
+
+def prepare_supplier_data_sage(df: pd.DataFrame, boundary: SupplierBoundary,
+                                row_offset: int = 0) -> pd.DataFrame:
+    """Prépare les données d'un fournisseur depuis un GL SAGE."""
+    supplier_df = df.iloc[boundary.start_row: boundary.end_row + 1].copy()
+    supplier_df = supplier_df.reset_index(drop=False).rename(columns={"index": "original_row"})
+    supplier_df["original_row"] = supplier_df["original_row"] + row_offset
+
+    ci = SAGE_COL_INDEX
+
+    result = pd.DataFrame()
+    result["original_row"]  = supplier_df["original_row"]
+    result["LibelleColA"]   = supplier_df.iloc[:, ci["compte"] + 1].apply(normalize_text)
+    result["DateOperation"] = supplier_df.iloc[:, ci["date"] + 1].apply(safe_date)
+    result["JournalColC"]   = supplier_df.iloc[:, ci["journal"] + 1].apply(normalize_text)
+    result["PieceColD"]     = supplier_df.iloc[:, ci["piece"] + 1].apply(normalize_text)
+    result["LibelleColE"]   = supplier_df.iloc[:, ci["libelle"] + 1].apply(normalize_text)
+    result["Lettrage"]      = supplier_df.iloc[:, ci["lettrage"] + 1].apply(normalize_text)
+    result["Debit"]         = supplier_df.iloc[:, ci["debit"] + 1].apply(normalize_amount)
+    result["Credit"]        = supplier_df.iloc[:, ci["credit"] + 1].apply(normalize_amount)
+
+    # N° facture = N° de pièce (col D) ; fallback sur libellé si vide
+    result["NumeroFacture"] = [
+        p if p else lib
+        for p, lib in zip(result["PieceColD"], result["LibelleColE"])
+    ]
+
+    return result
+
+
 def find_supplier_boundaries(df: pd.DataFrame) -> List[SupplierBoundary]:
     suppliers = []
     current_supplier = None
@@ -432,10 +519,14 @@ def allocate_fifo(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
 def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                      reference_date: pd.Timestamp, opening_date: pd.Timestamp,
                      mode: str = "civile", year_filter: Optional[int] = None,
-                     gl_format: str = "coala"):
+                     gl_format: str = "coala",
+                     invoice_journals: Optional[List[str]] = None,
+                     payment_journals: Optional[List[str]] = None):
     """
     gl_format : "coala"    → détection solde ouverture via LibelleColA, allocation FIFO
                 "pennyland" → détection solde ouverture via JournalColC=="AA", allocation par montant
+                "sage"      → journaux factures/paiements fournis par l'utilisateur
+    invoice_journals / payment_journals : pour SAGE, listes des codes journaux.
     """
     paid_rows = []
     unpaid_rows = []
@@ -445,18 +536,32 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # --- Masque solde d'ouverture (varie selon le format) ---
     # "mixed" = un fichier COALA + un fichier PENNYLAND → on combine les deux détections
     _AN_JOURNALS = {"AA", "AD", "AN"}
+    journals_upper = supplier_df["JournalColC"].str.upper()
     if gl_format == "pennyland":
-        opening_mask = supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+        opening_mask = journals_upper.isin(_AN_JOURNALS)
+    elif gl_format == "sage":
+        opening_mask = journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_mask = (
-            supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+            journals_upper.isin(_AN_JOURNALS)
             | supplier_df["LibelleColA"].apply(is_opening_balance_row)
         )
     else:  # coala
         opening_mask = (
             supplier_df["LibelleColA"].apply(is_opening_balance_row)
-            | supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+            | journals_upper.isin(_AN_JOURNALS)
         )
+
+    # --- Masques journaux (factures / paiements) ---
+    if gl_format == "sage":
+        inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
+        pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
+        # Inclure AA/AD/AN pour 2025+ même si l'utilisateur ne les a pas listés
+        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+        pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
+    else:
+        inv_journal_mask = journals_upper.str.startswith("A", na=False)
+        pay_journal_mask = pd.Series(True, index=supplier_df.index)
 
     # Pour 2025+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
     # Les à nouveau (AA/AD/AN) sont inclus comme factures si leur date est >= 2025
@@ -478,7 +583,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
-        & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
+        & inv_journal_mask
         & (~invoice_excl_mask)                             # exclure à nouveau sauf pour 2025+
         & _invoice_year_ok(supplier_df["DateOperation"])
         & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
@@ -487,6 +592,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     payments_lettered = supplier_df[
         (supplier_df["Debit"] > 0)
         & (supplier_df["Lettrage"] != "")
+        & pay_journal_mask
     ].copy()
 
     if not invoices_lettered.empty:
@@ -617,7 +723,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     unpaid_invoices = supplier_df[
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] == "")
-        & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
+        & inv_journal_mask
         & (~invoice_excl_mask)
         & _invoice_year_ok(supplier_df["DateOperation"])
         & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
@@ -632,6 +738,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         (supplier_df["Debit"] > 0)
         & (supplier_df["Lettrage"] == "")
         & (~opening_mask)
+        & pay_journal_mask
         # Exclure les paiements postérieurs à la date de clôture
         & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
@@ -805,33 +912,46 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
 
 def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                         year_filter: int = None, gl_format: str = "coala",
-                        reference_date: pd.Timestamp = None):
+                        reference_date: pd.Timestamp = None,
+                        invoice_journals: Optional[List[str]] = None):
     """Calcule la ligne de contrôle pour un fournisseur.
     year_filter    : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
     gl_format      : détection du solde d'ouverture adaptée au format.
     reference_date : si fourni, on exclut les crédits postérieurs à cette date (utile en mode trimestriel).
+    invoice_journals : pour SAGE, liste des codes journaux facture.
     """
     _AN_JOURNALS = {"AA", "AD", "AN"}
+    journals_upper = supplier_df["JournalColC"].str.upper()
     if gl_format == "pennyland":
-        opening_excl = supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+        opening_excl = journals_upper.isin(_AN_JOURNALS)
+    elif gl_format == "sage":
+        opening_excl = journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_excl = (
-            supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+            journals_upper.isin(_AN_JOURNALS)
             | supplier_df["LibelleColE"].apply(is_opening_balance_row)
         )
     else:  # coala
         opening_excl = (
             supplier_df["LibelleColE"].apply(is_opening_balance_row)
-            | supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+            | journals_upper.isin(_AN_JOURNALS)
         )
 
     # Les à nouveau (AA/AD/AN) sont inclus si leur date est >= 2025
     _is_2025_plus = supplier_df["DateOperation"].dt.year >= 2025
     opening_excl = opening_excl & ~_is_2025_plus.fillna(False)
 
+    # Masque journaux factures (SAGE uniquement)
+    if gl_format == "sage":
+        inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
+        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+    else:
+        inv_journal_mask = pd.Series(True, index=supplier_df.index)
+
     mask = (
         (supplier_df["Credit"] > 0)
         & (~opening_excl)
+        & inv_journal_mask
         & (supplier_df["DateOperation"].dt.year >= 2025)
     )
     if year_filter is not None:
@@ -1007,6 +1127,43 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
     return _finalize_results(all_paid, all_unpaid, control_rows)
 
 
+def process_workbook_sage(uploaded_file, sheet_name,
+                           reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                           invoice_journals: List[str], payment_journals: List[str]):
+    """Traitement GL SAGE – mode Année civile."""
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+
+    if df.shape[1] < 8:
+        raise ValueError("Le fichier GL SAGE doit contenir au minimum 8 colonnes (A à H).")
+
+    suppliers = find_supplier_boundaries_sage(df)
+    if not suppliers:
+        raise ValueError("Aucun fournisseur détecté dans le fichier GL SAGE.")
+
+    all_paid, all_unpaid, control_rows = [], [], []
+    year = reference_date.year
+
+    for boundary in suppliers:
+        supplier_df = prepare_supplier_data_sage(df, boundary)
+        paid_rows, unpaid_rows = process_supplier(
+            boundary, supplier_df, reference_date, opening_date,
+            mode="civile", year_filter=year, gl_format="sage",
+            invoice_journals=invoice_journals, payment_journals=payment_journals
+        )
+        paid_rows   = _filter_by_year(paid_rows,   year)
+        unpaid_rows = _filter_by_year(unpaid_rows, year)
+        all_paid.extend(paid_rows)
+        all_unpaid.extend(unpaid_rows)
+        control_rows.append(
+            _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                               year_filter=year, gl_format="sage",
+                               reference_date=reference_date,
+                               invoice_journals=invoice_journals)
+        )
+
+    return _finalize_results(all_paid, all_unpaid, control_rows)
+
+
 def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
     """Lit un fichier Excel selon le format GL et retourne (df, find_boundaries_fn, prepare_fn)."""
     if gl_format == "pennyland":
@@ -1014,6 +1171,11 @@ def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
         if df.shape[1] < 12:
             raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
         return df, find_supplier_boundaries_pennyland, prepare_supplier_data_pennyland
+    elif gl_format == "sage":
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+        if df.shape[1] < 8:
+            raise ValueError("Le fichier GL SAGE doit contenir au minimum 8 colonnes (A à H).")
+        return df, find_supplier_boundaries_sage, prepare_supplier_data_sage
     else:  # coala
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
         if df.shape[1] < 8:
@@ -1023,7 +1185,9 @@ def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
 
 def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
                               reference_date: pd.Timestamp, opening_date: pd.Timestamp,
-                              row_offset: int = 0):
+                              row_offset: int = 0,
+                              invoice_journals: Optional[List[str]] = None,
+                              payment_journals: Optional[List[str]] = None):
     """Traite un seul fichier en mode cheval (année civile avec filtre + règle paiement post-clôture).
     Utilisé pour le mode MIXED où les deux fichiers ont des formats différents.
     """
@@ -1035,7 +1199,8 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
         supplier_df = prep_fn(df, boundary, row_offset=row_offset)
         paid_rows, unpaid_rows = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
-            mode="civile", year_filter=year, gl_format=gl_fmt
+            mode="civile", year_filter=year, gl_format=gl_fmt,
+            invoice_journals=invoice_journals, payment_journals=payment_journals
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1051,7 +1216,11 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
 
 def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
                                      file2, sheet2, gl_format2: str,
-                                     reference_date: pd.Timestamp, opening_date: pd.Timestamp):
+                                     reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                                     invoice_journals1: Optional[List[str]] = None,
+                                     payment_journals1: Optional[List[str]] = None,
+                                     invoice_journals2: Optional[List[str]] = None,
+                                     payment_journals2: Optional[List[str]] = None):
     """Traitement Année à cheval générique : chaque fichier peut être COALA ou PENNYLAND.
 
     • Même format (COALA+COALA ou PENNYLAND+PENNYLAND) :
@@ -1102,7 +1271,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
 
             paid_rows, unpaid_rows = process_supplier(
                 boundary, supplier_df, reference_date, opening_date,
-                mode="cheval", year_filter=None, gl_format=combined_gl_format
+                mode="cheval", year_filter=None, gl_format=combined_gl_format,
+                invoice_journals=invoice_journals1, payment_journals=payment_journals1
             )
             paid_rows   = _filter_by_year(paid_rows,   valid_years)
             unpaid_rows = _filter_by_year(unpaid_rows, valid_years)
@@ -1112,7 +1282,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
             control_rows.append(
                 _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                    year_filter=year, gl_format=combined_gl_format,
-                                   reference_date=reference_date)
+                                   reference_date=reference_date,
+                                   invoice_journals=invoice_journals1)
             )
 
         return _finalize_results(all_paid, all_unpaid, control_rows)
@@ -1122,11 +1293,13 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
     # peuvent pas être mis en correspondance inter-fichiers.
     # Chaque fichier est traité séparément en mode civile + filtre année N.
     paid1, unpaid1, ctrl1 = _process_one_file_cheval(
-        df1, find_fn1, prep_fn1, gl_format1, reference_date, opening_date, row_offset=0
+        df1, find_fn1, prep_fn1, gl_format1, reference_date, opening_date, row_offset=0,
+        invoice_journals=invoice_journals1, payment_journals=payment_journals1
     )
     paid2, unpaid2, ctrl2 = _process_one_file_cheval(
         df2, find_fn2, prep_fn2, gl_format2, reference_date, opening_date,
-        row_offset=len(df1) + 10000
+        row_offset=len(df1) + 10000,
+        invoice_journals=invoice_journals2, payment_journals=payment_journals2
     )
 
     if not paid1 and not unpaid1 and not paid2 and not unpaid2:
@@ -1178,7 +1351,7 @@ def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
 # ============================================================
 
 with st.expander("Format attendu du fichier Excel", expanded=False):
-    tab_coala, tab_pennyland = st.tabs(["GL COALA", "GL PENNYLAND"])
+    tab_coala, tab_pennyland, tab_sage = st.tabs(["GL COALA", "GL PENNYLAND", "GL SAGE"])
     with tab_coala:
         st.markdown(
             """
@@ -1208,6 +1381,23 @@ with st.expander("Format attendu du fichier Excel", expanded=False):
 
 **Règles :** Factures = Crédit col L + journal commence par `A` (hors `AA`) ·
 Paiements lettrés → matching par montant identique · Paiements non lettrés → FIFO
+"""
+        )
+    with tab_sage:
+        st.markdown(
+            """
+- **Colonne A (COMPTE)** : code fournisseur – chaque N° = un fournisseur
+- **Colonne B (DATE)** : date de la facture
+- **Colonne C (CODE J)** : journal (factures et paiements à configurer)
+- **Colonne D (N° DE PIECE)** : numéro de pièce (= numéro de facture)
+- **Colonne E (LIBELLE)** : libellé
+- **Colonne F (LETTRAGE)** : lettrage
+- **Colonne G (DEBIT)** : paiement ou avoir
+- **Colonne H (CREDIT)** : facture
+
+**Règles :** L'utilisateur précise les journaux factures et paiements (ex: `OD` ou `OD,VE`) ·
+Paiements lettrés → matching par montant identique · Paiements non lettrés → FIFO ·
+`AA`/`AD`/`AN` inclus comme factures si date ≥ 2025
 """
         )
 
@@ -1256,10 +1446,41 @@ st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date
 
 st.divider()
 
-GL_OPTIONS = ["GL COALA", "GL PENNYLAND"]
+GL_OPTIONS = ["GL COALA", "GL PENNYLAND", "GL SAGE"]
 
 def _gl_label_to_format(label: str) -> str:
-    return "pennyland" if label == "GL PENNYLAND" else "coala"
+    if label == "GL PENNYLAND":
+        return "pennyland"
+    if label == "GL SAGE":
+        return "sage"
+    return "coala"
+
+def _parse_journals(text: str) -> List[str]:
+    """Parse une saisie utilisateur en liste de journaux (séparateur virgule)."""
+    if not text:
+        return []
+    return [j.strip().upper() for j in text.split(",") if j.strip()]
+
+def _sage_journal_inputs(key_prefix: str) -> Tuple[List[str], List[str], bool]:
+    """Affiche les deux champs journaux pour SAGE et retourne (inv, pay, is_valid)."""
+    st.caption("Format GL SAGE : précisez les codes journaux (séparez par virgule).")
+    col_j1, col_j2 = st.columns(2)
+    with col_j1:
+        inv_text = st.text_input(
+            "Journaux des factures (ex: `OD` ou `OD,VE,AC`)",
+            key=f"{key_prefix}_inv_j",
+        )
+    with col_j2:
+        pay_text = st.text_input(
+            "Journaux des paiements (ex: `BQ` ou `BQ,CA`)",
+            key=f"{key_prefix}_pay_j",
+        )
+    inv = _parse_journals(inv_text)
+    pay = _parse_journals(pay_text)
+    valid = bool(inv) and bool(pay)
+    if not valid:
+        st.info("Renseignez au moins un journal facture et un journal paiement.")
+    return inv, pay, valid
 
 def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = ""):
     st.success("Traitement terminé avec succès.")
@@ -1294,6 +1515,10 @@ if not is_cheval:
             type=["xlsx", "xls"], key="up_civile"
         )
 
+    sage_inv_j, sage_pay_j, sage_valid = [], [], True
+    if gl_fmt_label == "GL SAGE":
+        sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs("civile")
+
     if uploaded_file is not None:
         try:
             xl = pd.ExcelFile(uploaded_file)
@@ -1304,13 +1529,19 @@ if not is_cheval:
 
         selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
 
-        if st.button("Lancer le traitement", type="primary"):
+        btn_disabled = (gl_fmt_label == "GL SAGE") and not sage_valid
+        if st.button("Lancer le traitement", type="primary", disabled=btn_disabled):
             try:
                 uploaded_file.seek(0)
                 gl_fmt = _gl_label_to_format(gl_fmt_label)
                 if gl_fmt == "pennyland":
                     result_df, paid_df, unpaid_df, control_df = process_workbook_pennyland(
                         uploaded_file, selected_sheet, reference_date, opening_date
+                    )
+                elif gl_fmt == "sage":
+                    result_df, paid_df, unpaid_df, control_df = process_workbook_sage(
+                        uploaded_file, selected_sheet, reference_date, opening_date,
+                        sage_inv_j, sage_pay_j
                     )
                 else:
                     result_df, paid_df, unpaid_df, control_df = process_workbook(
@@ -1330,7 +1561,7 @@ else:
         f"**Année à cheval** : chargez les deux grands livres. "
         f"Seules les factures de **{int(selected_year)}** apparaîtront. "
         f"Clôture : **31/12/{int(selected_year)}**. "
-        f"Chaque fichier peut avoir son propre format (COALA ou PENNYLAND)."
+        f"Chaque fichier peut avoir son propre format (COALA, PENNYLAND ou SAGE)."
     )
 
     col_f1, col_f2 = st.columns(2)
@@ -1352,6 +1583,9 @@ else:
                 )
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N-1 : {e}")
+        sage_inv_j1, sage_pay_j1, sage_valid1 = [], [], True
+        if gl_fmt1_label == "GL SAGE":
+            sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs("cheval1")
 
     with col_f2:
         st.markdown(f"#### Grand livre — Année {int(selected_year)}")
@@ -1370,6 +1604,9 @@ else:
                 )
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N : {e}")
+        sage_inv_j2, sage_pay_j2, sage_valid2 = [], [], True
+        if gl_fmt2_label == "GL SAGE":
+            sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs("cheval2")
 
     both_ready = (
         file1 is not None and file2 is not None
@@ -1378,14 +1615,18 @@ else:
 
     if both_ready:
         fmt_combo = f"{gl_fmt1_label} + {gl_fmt2_label}"
-        if st.button(f"Lancer le traitement à cheval ({fmt_combo})", type="primary"):
+        btn_disabled = not (sage_valid1 and sage_valid2)
+        if st.button(f"Lancer le traitement à cheval ({fmt_combo})", type="primary",
+                     disabled=btn_disabled):
             try:
                 file1.seek(0)
                 file2.seek(0)
                 result_df, paid_df, unpaid_df, control_df = process_workbook_cheval_generic(
                     file1, sheet1, _gl_label_to_format(gl_fmt1_label),
                     file2, sheet2, _gl_label_to_format(gl_fmt2_label),
-                    reference_date, opening_date
+                    reference_date, opening_date,
+                    invoice_journals1=sage_inv_j1, payment_journals1=sage_pay_j1,
+                    invoice_journals2=sage_inv_j2, payment_journals2=sage_pay_j2,
                 )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
                               int(selected_year), suffix=f"_cheval{quarter_suffix}")
