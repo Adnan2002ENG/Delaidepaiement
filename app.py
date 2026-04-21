@@ -830,9 +830,9 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     else:
         unpaid_working = unpaid_invoices.copy()
 
-    # 2B) Paiements non lettrés => FIFO sur factures non lettrées
+    # 2B) Paiements non lettrés => 1) match montant identique, 2) FIFO sur le reste
     if not unpaid_working.empty and not unlettered_payments.empty:
-        fifo_allocations, fifo_residuals = allocate_fifo(unpaid_working, unlettered_payments)
+        fifo_allocations, fifo_residuals = allocate_amount_match(unpaid_working, unlettered_payments)
 
         for alloc in fifo_allocations:
             inv = alloc["invoice_row"]
