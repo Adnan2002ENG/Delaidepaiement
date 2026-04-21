@@ -459,10 +459,9 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         )
 
     # Pour 2025+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
-    if year_filter is not None and year_filter >= 2025:
-        invoice_excl_mask = pd.Series(False, index=supplier_df.index)
-    else:
-        invoice_excl_mask = opening_mask
+    # Les à nouveau (AA/AD/AN) sont inclus comme factures si leur date est >= 2025
+    _is_2025_plus = supplier_df["DateOperation"].dt.year >= 2025
+    invoice_excl_mask = opening_mask & ~_is_2025_plus.fillna(False)
 
     # --- Fonction d'allocation lettrée (varie selon le format) ---
     # Pour "mixed" et "pennyland" : matching par montant (avec fallback FIFO intégré)
@@ -473,8 +472,8 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # ============================================================
     def _invoice_year_ok(s):
         if year_filter is None:
-            return pd.Series([True] * len(s), index=s.index)
-        return s.dt.year == year_filter
+            return s.dt.year >= 2025
+        return (s.dt.year >= 2025) & (s.dt.year <= year_filter)
 
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
@@ -826,16 +825,17 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
             | supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
         )
 
-    # Pour 2025+ : inclure les à nouveau dans le total de contrôle
-    if year_filter is not None and year_filter >= 2025:
-        opening_excl = pd.Series(False, index=supplier_df.index)
+    # Les à nouveau (AA/AD/AN) sont inclus si leur date est >= 2025
+    _is_2025_plus = supplier_df["DateOperation"].dt.year >= 2025
+    opening_excl = opening_excl & ~_is_2025_plus.fillna(False)
 
     mask = (
         (supplier_df["Credit"] > 0)
         & (~opening_excl)
+        & (supplier_df["DateOperation"].dt.year >= 2025)
     )
     if year_filter is not None:
-        mask = mask & (supplier_df["DateOperation"].dt.year == year_filter)
+        mask = mask & (supplier_df["DateOperation"].dt.year <= year_filter)
     if reference_date is not None:
         mask = mask & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
 
