@@ -381,9 +381,16 @@ def prepare_supplier_data(df: pd.DataFrame, boundary: SupplierBoundary, row_offs
 
 
 def allocate_amount_match(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame):
-    """Allocation par montant identique (format GL PENNYLAND).
-    Pour chaque facture, on cherche le paiement dont le montant restant est identique.
-    Si aucun paiement de montant exact n'est trouvé, on applique FIFO en dernier recours.
+    """Allocation en 2 passes (factures / paiements lettrés avec plusieurs lignes).
+
+    Passe 1 — rapprochement par montant identique :
+        Pour chaque facture, on cherche un paiement avec un montant restant
+        strictement égal (tolérance 0.01). Si trouvé, appariement direct.
+
+    Passe 2 — FIFO sur le reste (paiement le plus ancien × facture la plus ancienne) :
+        Les factures / paiements non appariés en passe 1 sont triés par date
+        croissante puis alloués en FIFO (un paiement peut couvrir plusieurs
+        factures et vice-versa).
     """
     allocations = []
     residuals   = []
@@ -391,63 +398,77 @@ def allocate_amount_match(invoice_rows: pd.DataFrame, payment_rows: pd.DataFrame
     if invoice_rows.empty:
         return allocations, residuals
 
-    available = []
-    for _, pay in payment_rows.iterrows():
-        available.append({"row": pay, "remaining": round(pay["Debit"], 2)})
+    invoices = [
+        {"row": inv, "remaining": round(inv["Credit"], 2), "total": round(inv["Credit"], 2)}
+        for _, inv in invoice_rows.iterrows()
+    ]
+    payments = [
+        {"row": pay, "remaining": round(pay["Debit"], 2)}
+        for _, pay in payment_rows.iterrows()
+    ]
 
-    for _, inv in invoice_rows.iterrows():
-        inv_amount = round(inv["Credit"], 2)
-
-        # Chercher un paiement de montant exact (tolérance 0.01)
-        best_idx = None
-        for i, pay_obj in enumerate(available):
+    # ── Passe 1 : rapprochement par montant identique ───────────────
+    for inv_obj in invoices:
+        if inv_obj["remaining"] <= 0:
+            continue
+        for pay_obj in payments:
             if pay_obj["remaining"] <= 0:
                 continue
-            if abs(pay_obj["remaining"] - inv_amount) < 0.01:
-                best_idx = i
-                break
-
-        if best_idx is not None:
-            pay_obj = available[best_idx]
-            allocations.append({
-                "invoice_row":    inv,
-                "payment_row":    pay_obj["row"],
-                "allocated_amount": inv_amount,
-                "invoice_total":  inv_amount,
-            })
-            pay_obj["remaining"] = round(pay_obj["remaining"] - inv_amount, 2)
-        else:
-            # Aucun paiement de montant exact → FIFO partiel
-            matched = False
-            for pay_obj in available:
-                if pay_obj["remaining"] <= 0:
-                    continue
-                allocated = round(min(inv_amount, pay_obj["remaining"]), 2)
-                if allocated <= 0:
-                    continue
+            if abs(pay_obj["remaining"] - inv_obj["remaining"]) < 0.01:
+                amount = inv_obj["remaining"]
                 allocations.append({
-                    "invoice_row":    inv,
-                    "payment_row":    pay_obj["row"],
-                    "allocated_amount": allocated,
-                    "invoice_total":  inv_amount,
+                    "invoice_row":      inv_obj["row"],
+                    "payment_row":      pay_obj["row"],
+                    "allocated_amount": amount,
+                    "invoice_total":    inv_obj["total"],
                 })
-                pay_obj["remaining"] = round(pay_obj["remaining"] - allocated, 2)
-                remaining_inv = round(inv_amount - allocated, 2)
-                if remaining_inv > 0.01:
-                    residuals.append({
-                        "invoice_row":    inv,
-                        "remaining_amount": remaining_inv,
-                        "invoice_total":  inv_amount,
-                    })
-                matched = True
+                pay_obj["remaining"] = round(pay_obj["remaining"] - amount, 2)
+                inv_obj["remaining"] = 0
                 break
 
-            if not matched:
-                residuals.append({
-                    "invoice_row":    inv,
-                    "remaining_amount": inv_amount,
-                    "invoice_total":  inv_amount,
-                })
+    # ── Passe 2 : FIFO sur le reste (trié par date) ─────────────────
+    def _sort_key(obj):
+        d = obj["row"]["DateOperation"]
+        return (
+            pd.Timestamp.max if pd.isna(d) else d,
+            int(obj["row"].get("original_row", 0) or 0),
+        )
+
+    remaining_invoices = sorted(
+        [i for i in invoices if i["remaining"] > 0.01], key=_sort_key
+    )
+    remaining_payments = sorted(
+        [p for p in payments if p["remaining"] > 0.01], key=_sort_key
+    )
+
+    pay_idx = 0
+    for inv_obj in remaining_invoices:
+        while inv_obj["remaining"] > 0.01 and pay_idx < len(remaining_payments):
+            pay_obj = remaining_payments[pay_idx]
+            if pay_obj["remaining"] <= 0:
+                pay_idx += 1
+                continue
+            allocated = round(min(inv_obj["remaining"], pay_obj["remaining"]), 2)
+            if allocated <= 0:
+                pay_idx += 1
+                continue
+            allocations.append({
+                "invoice_row":      inv_obj["row"],
+                "payment_row":      pay_obj["row"],
+                "allocated_amount": allocated,
+                "invoice_total":    inv_obj["total"],
+            })
+            inv_obj["remaining"] = round(inv_obj["remaining"] - allocated, 2)
+            pay_obj["remaining"] = round(pay_obj["remaining"] - allocated, 2)
+            if pay_obj["remaining"] <= 0:
+                pay_idx += 1
+
+        if inv_obj["remaining"] > 0.01:
+            residuals.append({
+                "invoice_row":      inv_obj["row"],
+                "remaining_amount": inv_obj["remaining"],
+                "invoice_total":    inv_obj["total"],
+            })
 
     return allocations, residuals
 
