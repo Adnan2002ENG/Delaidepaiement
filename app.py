@@ -472,6 +472,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
         & (~opening_mask)                                  # exclure Report à nouveau (AA)
         & _invoice_year_ok(supplier_df["DateOperation"])
+        & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
 
     payments_lettered = supplier_df[
@@ -610,6 +611,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
         & (~opening_mask)
         & _invoice_year_ok(supplier_df["DateOperation"])
+        & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
 
     unpaid_invoices = unpaid_invoices.sort_values(by=["DateOperation", "original_row"], na_position="last")
@@ -793,10 +795,12 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
 
 
 def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
-                        year_filter: int = None, gl_format: str = "coala"):
+                        year_filter: int = None, gl_format: str = "coala",
+                        reference_date: pd.Timestamp = None):
     """Calcule la ligne de contrôle pour un fournisseur.
-    year_filter : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
-    gl_format   : détection du solde d'ouverture adaptée au format.
+    year_filter    : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
+    gl_format      : détection du solde d'ouverture adaptée au format.
+    reference_date : si fourni, on exclut les crédits postérieurs à cette date (utile en mode trimestriel).
     """
     if gl_format == "pennyland":
         opening_excl = supplier_df["JournalColC"].str.upper() == "AA"
@@ -814,6 +818,8 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     )
     if year_filter is not None:
         mask = mask & (supplier_df["DateOperation"].dt.year == year_filter)
+    if reference_date is not None:
+        mask = mask & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
 
     total_credit_source = round(supplier_df.loc[mask, "Credit"].sum(), 2)
 
@@ -878,7 +884,7 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
 
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
-        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df))
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, reference_date=reference_date))
 
     return _finalize_results(all_paid, all_unpaid, control_rows)
 
@@ -940,7 +946,7 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
 
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
-        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter=year))
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter=year, reference_date=reference_date))
 
     return _finalize_results(all_paid, all_unpaid, control_rows)
 
@@ -976,7 +982,8 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
         all_unpaid.extend(unpaid_rows)
         control_rows.append(
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
-                               year_filter=year, gl_format="pennyland")
+                               year_filter=year, gl_format="pennyland",
+                               reference_date=reference_date)
         )
 
     return _finalize_results(all_paid, all_unpaid, control_rows)
@@ -1018,7 +1025,8 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
         all_unpaid.extend(unpaid_rows)
         ctrl.append(
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
-                               year_filter=year, gl_format=gl_fmt)
+                               year_filter=year, gl_format=gl_fmt,
+                               reference_date=reference_date)
         )
     return all_paid, all_unpaid, ctrl
 
@@ -1085,7 +1093,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
             all_unpaid.extend(unpaid_rows)
             control_rows.append(
                 _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
-                                   year_filter=year, gl_format=combined_gl_format)
+                                   year_filter=year, gl_format=combined_gl_format,
+                                   reference_date=reference_date)
             )
 
         return _finalize_results(all_paid, all_unpaid, control_rows)
@@ -1199,8 +1208,31 @@ with col_m:
         horizontal=True,
     )
 
-reference_date = pd.Timestamp(f"{int(selected_year)}-12-31")
-opening_date   = pd.Timestamp(f"{int(selected_year)}-01-01")
+QUARTER_END_DATES = {
+    "T1 — 1er trimestre (31/03)":  f"{int(selected_year)}-03-31",
+    "T2 — 2ème trimestre (30/06)": f"{int(selected_year)}-06-30",
+    "T3 — 3ème trimestre (30/09)": f"{int(selected_year)}-09-30",
+    "T4 — 4ème trimestre (31/12)": f"{int(selected_year)}-12-31",
+}
+
+col_decl, col_trim = st.columns([1, 2])
+with col_decl:
+    decl_type = st.radio(
+        "Type de déclaration",
+        ["Annuelle", "Trimestrielle"],
+        horizontal=True,
+    )
+
+quarter_suffix = ""
+with col_trim:
+    if decl_type == "Trimestrielle":
+        selected_quarter = st.selectbox("Trimestre", list(QUARTER_END_DATES.keys()))
+        reference_date = pd.Timestamp(QUARTER_END_DATES[selected_quarter])
+        quarter_suffix = f"_{selected_quarter[:2]}"   # "_T1", "_T2", "_T3", "_T4"
+    else:
+        reference_date = pd.Timestamp(f"{int(selected_year)}-12-31")
+
+opening_date = pd.Timestamp(f"{int(selected_year)}-01-01")
 
 st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date d'ouverture : **{opening_date.date()}**")
 
@@ -1266,7 +1298,7 @@ if not is_cheval:
                     result_df, paid_df, unpaid_df, control_df = process_workbook(
                         uploaded_file, selected_sheet, reference_date, opening_date
                     )
-                _show_results(result_df, paid_df, unpaid_df, control_df, int(selected_year))
+                _show_results(result_df, paid_df, unpaid_df, control_df, int(selected_year), suffix=quarter_suffix)
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
@@ -1338,7 +1370,7 @@ else:
                     reference_date, opening_date
                 )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
-                              int(selected_year), suffix="_cheval")
+                              int(selected_year), suffix=f"_cheval{quarter_suffix}")
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
