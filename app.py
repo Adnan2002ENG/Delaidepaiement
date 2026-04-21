@@ -444,15 +444,25 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
 
     # --- Masque solde d'ouverture (varie selon le format) ---
     # "mixed" = un fichier COALA + un fichier PENNYLAND → on combine les deux détections
+    _AN_JOURNALS = {"AA", "AD", "AN"}
     if gl_format == "pennyland":
-        opening_mask = supplier_df["JournalColC"].str.upper() == "AA"
+        opening_mask = supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_mask = (
-            (supplier_df["JournalColC"].str.upper() == "AA")
+            supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
             | supplier_df["LibelleColA"].apply(is_opening_balance_row)
         )
     else:  # coala
-        opening_mask = supplier_df["LibelleColA"].apply(is_opening_balance_row)
+        opening_mask = (
+            supplier_df["LibelleColA"].apply(is_opening_balance_row)
+            | supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+        )
+
+    # Pour 2025+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
+    if year_filter is not None and year_filter >= 2025:
+        invoice_excl_mask = pd.Series(False, index=supplier_df.index)
+    else:
+        invoice_excl_mask = opening_mask
 
     # --- Fonction d'allocation lettrée (varie selon le format) ---
     # Pour "mixed" et "pennyland" : matching par montant (avec fallback FIFO intégré)
@@ -470,7 +480,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] != "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
-        & (~opening_mask)                                  # exclure Report à nouveau (AA)
+        & (~invoice_excl_mask)                             # exclure à nouveau sauf pour 2025+
         & _invoice_year_ok(supplier_df["DateOperation"])
         & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
@@ -609,7 +619,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         (supplier_df["Credit"] > 0)
         & (supplier_df["Lettrage"] == "")
         & (supplier_df["JournalColC"].str.upper().str.startswith("A", na=False))
-        & (~opening_mask)
+        & (~invoice_excl_mask)
         & _invoice_year_ok(supplier_df["DateOperation"])
         & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
     ].copy()
@@ -802,15 +812,23 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     gl_format      : détection du solde d'ouverture adaptée au format.
     reference_date : si fourni, on exclut les crédits postérieurs à cette date (utile en mode trimestriel).
     """
+    _AN_JOURNALS = {"AA", "AD", "AN"}
     if gl_format == "pennyland":
-        opening_excl = supplier_df["JournalColC"].str.upper() == "AA"
+        opening_excl = supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_excl = (
-            (supplier_df["JournalColC"].str.upper() == "AA")
+            supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
             | supplier_df["LibelleColE"].apply(is_opening_balance_row)
         )
     else:  # coala
-        opening_excl = supplier_df["LibelleColE"].apply(is_opening_balance_row)
+        opening_excl = (
+            supplier_df["LibelleColE"].apply(is_opening_balance_row)
+            | supplier_df["JournalColC"].str.upper().isin(_AN_JOURNALS)
+        )
+
+    # Pour 2025+ : inclure les à nouveau dans le total de contrôle
+    if year_filter is not None and year_filter >= 2025:
+        opening_excl = pd.Series(False, index=supplier_df.index)
 
     mask = (
         (supplier_df["Credit"] > 0)
