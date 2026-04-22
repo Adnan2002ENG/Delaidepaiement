@@ -1005,11 +1005,13 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
 
 def _filter_by_year(rows: list, valid_years) -> list:
     """Garde uniquement les lignes dont la date facture est dans les années valides.
-    valid_years peut être un int (une seule année) ou un set d'années.
+    valid_years peut être :
+      • un int (ex: 2026) → interprété comme "de 2025 à cette année incluse"
+      • un set d'années → utilisé tel quel
     Les lignes sans date (None) sont conservées.
     """
     if isinstance(valid_years, int):
-        valid_years = {valid_years}
+        valid_years = set(range(2025, valid_years + 1)) if valid_years >= 2025 else {valid_years}
     result = []
     for r in rows:
         d = r.get("Date facture")
@@ -1076,7 +1078,7 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
 
     # Filtre : uniquement les factures de l'année choisie (N)
     year = reference_date.year
-    valid_years = {year}
+    valid_years = set(range(2025, year + 1)) if year >= 2025 else {year}
 
     for code in all_codes:
         b1 = map1.get(code)
@@ -1271,7 +1273,7 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
 
         all_paid, all_unpaid, control_rows = [], [], []
         year        = reference_date.year
-        valid_years = {year}
+        valid_years = set(range(2025, year + 1)) if year >= 2025 else {year}
 
         for code in all_codes:
             b1 = map1.get(code)
