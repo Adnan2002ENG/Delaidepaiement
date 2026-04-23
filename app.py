@@ -47,6 +47,19 @@ SAGE_COL_INDEX = {
 }
 
 
+# Année plancher pour la prise en compte des factures.
+# Valeur par défaut : 2025 (première année obligatoire de déclaration).
+# L'UI peut la descendre à 2024 via la checkbox "Inclure les factures 2024".
+MIN_INVOICE_YEAR = 2025
+
+
+def _min_year() -> int:
+    try:
+        return int(st.session_state.get("include_2024", False) and 2024 or MIN_INVOICE_YEAR)
+    except Exception:
+        return MIN_INVOICE_YEAR
+
+
 @dataclass
 class SupplierBoundary:
     supplier_code: str
@@ -584,10 +597,10 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         inv_journal_mask = journals_upper.str.startswith("A", na=False)
         pay_journal_mask = pd.Series(True, index=supplier_df.index)
 
-    # Pour 2025+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
-    # Les à nouveau (AA/AD/AN) sont inclus comme factures si leur date est >= 2025
-    _is_2025_plus = supplier_df["DateOperation"].dt.year >= 2025
-    invoice_excl_mask = opening_mask & ~_is_2025_plus.fillna(False)
+    # Pour min_year+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
+    _min_y = _min_year()
+    _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
+    invoice_excl_mask = opening_mask & ~_is_min_plus.fillna(False)
 
     # --- Fonction d'allocation lettrée (varie selon le format) ---
     # Pour "mixed" et "pennyland" : matching par montant (avec fallback FIFO intégré)
@@ -598,8 +611,8 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # ============================================================
     def _invoice_year_ok(s):
         if year_filter is None:
-            return s.dt.year >= 2025
-        return (s.dt.year >= 2025) & (s.dt.year <= year_filter)
+            return s.dt.year >= _min_y
+        return (s.dt.year >= _min_y) & (s.dt.year <= year_filter)
 
     invoices_lettered = supplier_df[
         (supplier_df["Credit"] > 0)
@@ -958,9 +971,10 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
             | journals_upper.isin(_AN_JOURNALS)
         )
 
-    # Les à nouveau (AA/AD/AN) sont inclus si leur date est >= 2025
-    _is_2025_plus = supplier_df["DateOperation"].dt.year >= 2025
-    opening_excl = opening_excl & ~_is_2025_plus.fillna(False)
+    # Les à nouveau (AA/AD/AN) sont inclus si leur date est >= min_year
+    _min_y = _min_year()
+    _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
+    opening_excl = opening_excl & ~_is_min_plus.fillna(False)
 
     # Masque journaux factures (SAGE uniquement)
     if gl_format == "sage":
@@ -973,7 +987,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
         (supplier_df["Credit"] > 0)
         & (~opening_excl)
         & inv_journal_mask
-        & (supplier_df["DateOperation"].dt.year >= 2025)
+        & (supplier_df["DateOperation"].dt.year >= _min_y)
     )
     if year_filter is not None:
         mask = mask & (supplier_df["DateOperation"].dt.year <= year_filter)
@@ -1011,7 +1025,8 @@ def _filter_by_year(rows: list, valid_years) -> list:
     Les lignes sans date (None) sont conservées.
     """
     if isinstance(valid_years, int):
-        valid_years = set(range(2025, valid_years + 1)) if valid_years >= 2025 else {valid_years}
+        _min_y = _min_year()
+        valid_years = set(range(_min_y, valid_years + 1)) if valid_years >= _min_y else {valid_years}
     result = []
     for r in rows:
         d = r.get("Date facture")
@@ -1078,7 +1093,8 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
 
     # Filtre : uniquement les factures de l'année choisie (N)
     year = reference_date.year
-    valid_years = set(range(2025, year + 1)) if year >= 2025 else {year}
+    _min_y = _min_year()
+    valid_years = set(range(_min_y, year + 1)) if year >= _min_y else {year}
 
     for code in all_codes:
         b1 = map1.get(code)
@@ -1273,7 +1289,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
 
         all_paid, all_unpaid, control_rows = [], [], []
         year        = reference_date.year
-        valid_years = set(range(2025, year + 1)) if year >= 2025 else {year}
+        _min_y = _min_year()
+        valid_years = set(range(_min_y, year + 1)) if year >= _min_y else {year}
 
         for code in all_codes:
             b1 = map1.get(code)
@@ -1438,6 +1455,12 @@ with col_m:
         ["Année civile (Janvier → Décembre)", "Année à cheval (deux grands livres)"],
         horizontal=True,
     )
+
+st.checkbox(
+    "Inclure les factures de 2024",
+    key="include_2024",
+    help="Si coché, l'année plancher pour la prise en compte des factures descend de 2025 à 2024.",
+)
 
 QUARTER_END_DATES = {
     "T1 — 1er trimestre (31/03)":  f"{int(selected_year)}-03-31",
