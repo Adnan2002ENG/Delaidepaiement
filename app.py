@@ -34,6 +34,19 @@ PENNYLAND_COL_INDEX = {
     "credit":      11,  # Crédit (col L)
 }
 
+# Colonnes GL LACTO (indices 0-basés, fichier lu avec header=2)
+# Col A = N° Let : contient soit l'entête fournisseur "4411XXX : NOM",
+#                   soit un numéro de lettrage, soit vide (ligne total).
+LACTO_COL_INDEX = {
+    "let_or_header": 0,  # A - N° Let / entête fournisseur
+    "date":          1,  # B - DATE
+    "journal":       2,  # C - Journal
+    "piece":         3,  # D - N° pièce
+    "libelle":       4,  # E - Libellé
+    "debit":         5,  # F - DEBIT
+    "credit":        6,  # G - CREDIT
+}
+
 # Colonnes GL SAGE (indices 0-basés, fichier lu avec header=1)
 SAGE_COL_INDEX = {
     "compte":   0,  # A - N° COMPTE → code fournisseur (groupement par changement)
@@ -343,6 +356,122 @@ def prepare_supplier_data_sage(df: pd.DataFrame, boundary: SupplierBoundary,
     return result
 
 
+_LACTO_SUPPLIER_RE = re.compile(r"^\s*(4411\S+)\s*(?::\s*(.+?))?\s*$")
+
+
+def _lacto_parse_supplier_header(value) -> Optional[Tuple[str, str]]:
+    """Retourne (code, nom) si la cellule col A est un en-tête fournisseur
+    (commence par '4411'), sinon None.
+    Formats supportés :
+      '4411AFRIQ : AFRIQUIA'  → ('4411AFRIQ', 'AFRIQUIA')
+      '4411AFRIQ'             → ('4411AFRIQ', '')
+    """
+    txt = normalize_text(value)
+    if not txt:
+        return None
+    m = _LACTO_SUPPLIER_RE.match(txt)
+    if not m:
+        return None
+    code = m.group(1).strip()
+    name = (m.group(2) or "").strip()
+    # On exige que le code commence bien par "4411" et qu'il contienne au moins
+    # un caractère non numérique (pour ne pas capter un simple numéro de pièce).
+    if not code.startswith("4411"):
+        return None
+    return code, name
+
+
+def find_supplier_boundaries_lacto(df: pd.DataFrame) -> List[SupplierBoundary]:
+    """Détecte les fournisseurs dans un GL LACTO.
+    Un en-tête fournisseur dans la colonne A commence par '4411'.
+    Les lignes qui suivent jusqu'au prochain en-tête (ou EOF) appartiennent
+    au même fournisseur. La ligne 'total' (col A vide, F/G renseignés) est
+    incluse dans la plage — elle sera ignorée car dépourvue de lettrage numérique
+    et de date.
+    """
+    suppliers: List[SupplierBoundary] = []
+    current = None  # (code, name, start_row)
+
+    for idx in range(len(df)):
+        header = _lacto_parse_supplier_header(
+            df.iat[idx, LACTO_COL_INDEX["let_or_header"]]
+        )
+        if header is not None:
+            if current is not None:
+                code, name, start = current
+                suppliers.append(SupplierBoundary(
+                    supplier_code=code,
+                    supplier_name=name,
+                    start_row=start,
+                    end_row=idx - 1,
+                ))
+            code, name = header
+            current = (code, name, idx + 1)  # sauter la ligne d'en-tête
+            continue
+
+    if current is not None:
+        code, name, start = current
+        if start < len(df):
+            suppliers.append(SupplierBoundary(
+                supplier_code=code,
+                supplier_name=name,
+                start_row=start,
+                end_row=len(df) - 1,
+            ))
+
+    return suppliers
+
+
+def prepare_supplier_data_lacto(df: pd.DataFrame, boundary: SupplierBoundary,
+                                 row_offset: int = 0) -> pd.DataFrame:
+    """Prépare les données d'un fournisseur depuis un GL LACTO."""
+    supplier_df = df.iloc[boundary.start_row: boundary.end_row + 1].copy()
+    supplier_df = supplier_df.reset_index(drop=False).rename(columns={"index": "original_row"})
+    supplier_df["original_row"] = supplier_df["original_row"] + row_offset
+
+    ci = LACTO_COL_INDEX
+
+    # Col A contient le numéro de lettrage (ou une entête supplier — déjà filtrée).
+    # On ne garde que les valeurs numériques comme lettrage ; sinon vide.
+    def _lettrage_val(v):
+        txt = normalize_text(v)
+        if not txt:
+            return ""
+        # Détecter une entête supplier à l'intérieur (sécurité)
+        if _lacto_parse_supplier_header(v) is not None:
+            return ""
+        # Garder les numériques (int/float → int string) ou alphanum court
+        try:
+            f = float(str(txt).replace(",", "."))
+            if f == int(f):
+                return str(int(f))
+            return str(f)
+        except Exception:
+            return txt
+
+    result = pd.DataFrame()
+    result["original_row"]  = supplier_df["original_row"]
+    result["LibelleColA"]   = ""  # pas de colonne "libellé A" en LACTO
+    result["DateOperation"] = supplier_df.iloc[:, ci["date"] + 1].apply(safe_date)
+    result["JournalColC"]   = supplier_df.iloc[:, ci["journal"] + 1].apply(normalize_text)
+    result["PieceColD"]     = supplier_df.iloc[:, ci["piece"] + 1].apply(normalize_text)
+    result["LibelleColE"]   = supplier_df.iloc[:, ci["libelle"] + 1].apply(normalize_text)
+    result["Lettrage"]      = supplier_df.iloc[:, ci["let_or_header"] + 1].apply(_lettrage_val)
+    result["Debit"]         = supplier_df.iloc[:, ci["debit"] + 1].apply(normalize_amount)
+    result["Credit"]        = supplier_df.iloc[:, ci["credit"] + 1].apply(normalize_amount)
+
+    # Écarte la ligne "total" (pas de date, pas de lettrage, mais Débit=Crédit)
+    # en la gardant mais sans lettrage et sans date → elle sera ignorée par les filtres.
+
+    # N° facture = N° de pièce (col D) ; fallback sur libellé si vide
+    result["NumeroFacture"] = [
+        p if p else lib
+        for p, lib in zip(result["PieceColD"], result["LibelleColE"])
+    ]
+
+    return result
+
+
 def find_supplier_boundaries(df: pd.DataFrame) -> List[SupplierBoundary]:
     suppliers = []
     current_supplier = None
@@ -571,9 +700,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # "mixed" = un fichier COALA + un fichier PENNYLAND → on combine les deux détections
     _AN_JOURNALS = {"AA", "AD", "AN"}
     journals_upper = supplier_df["JournalColC"].str.upper()
-    if gl_format == "pennyland":
-        opening_mask = journals_upper.isin(_AN_JOURNALS)
-    elif gl_format == "sage":
+    if gl_format in ("pennyland", "sage", "lacto"):
         opening_mask = journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_mask = (
@@ -587,7 +714,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         )
 
     # --- Masques journaux (factures / paiements) ---
-    if gl_format == "sage":
+    if gl_format in ("sage", "lacto"):
         inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
         pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
         # Inclure AA/AD/AN pour 2025+ même si l'utilisateur ne les a pas listés
@@ -956,9 +1083,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     """
     _AN_JOURNALS = {"AA", "AD", "AN"}
     journals_upper = supplier_df["JournalColC"].str.upper()
-    if gl_format == "pennyland":
-        opening_excl = journals_upper.isin(_AN_JOURNALS)
-    elif gl_format == "sage":
+    if gl_format in ("pennyland", "sage", "lacto"):
         opening_excl = journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "mixed":
         opening_excl = (
@@ -976,8 +1101,8 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
     opening_excl = opening_excl & ~_is_min_plus.fillna(False)
 
-    # Masque journaux factures (SAGE uniquement)
-    if gl_format == "sage":
+    # Masque journaux factures (SAGE + LACTO : journaux déclarés par l'utilisateur)
+    if gl_format in ("sage", "lacto"):
         inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
     else:
@@ -1239,6 +1364,53 @@ def process_workbook_sage(uploaded_file, sheet_name,
     return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
+def process_workbook_lacto(uploaded_file, sheet_name,
+                            reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                            invoice_journals: List[str], payment_journals: List[str]):
+    """Traitement GL LACTO – mode Année civile.
+    En-têtes fournisseur en col A (préfixe '4411'), colonne A = lettrage
+    pour les lignes d'opération. Journaux facture/paiement saisis par
+    l'utilisateur (même principe que SAGE).
+    """
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=2)
+
+    if df.shape[1] < 7:
+        raise ValueError("Le fichier GL LACTO doit contenir au minimum 7 colonnes (A à G).")
+
+    suppliers = find_supplier_boundaries_lacto(df)
+    if not suppliers:
+        raise ValueError(
+            "Aucun fournisseur détecté dans le fichier GL LACTO "
+            "(un en-tête fournisseur doit commencer par '4411' en colonne A)."
+        )
+
+    all_paid, all_unpaid, control_rows = [], [], []
+    all_payments_only = []
+    year = reference_date.year
+
+    for boundary in suppliers:
+        supplier_df = prepare_supplier_data_lacto(df, boundary)
+        paid_rows, unpaid_rows = process_supplier(
+            boundary, supplier_df, reference_date, opening_date,
+            mode="civile", year_filter=year, gl_format="lacto",
+            invoice_journals=invoice_journals, payment_journals=payment_journals
+        )
+        paid_rows   = _filter_by_year(paid_rows,   year)
+        unpaid_rows = _filter_by_year(unpaid_rows, year)
+        all_paid.extend(paid_rows)
+        all_unpaid.extend(unpaid_rows)
+        control_rows.append(
+            _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
+                               year_filter=year, gl_format="lacto",
+                               reference_date=reference_date,
+                               invoice_journals=invoice_journals)
+        )
+        if not paid_rows and not unpaid_rows:
+            all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
+
+    return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
+
+
 def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
     """Lit un fichier Excel selon le format GL et retourne (df, find_boundaries_fn, prepare_fn)."""
     if gl_format == "pennyland":
@@ -1251,6 +1423,11 @@ def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
         if df.shape[1] < 8:
             raise ValueError("Le fichier GL SAGE doit contenir au minimum 8 colonnes (A à H).")
         return df, find_supplier_boundaries_sage, prepare_supplier_data_sage
+    elif gl_format == "lacto":
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=2)
+        if df.shape[1] < 7:
+            raise ValueError("Le fichier GL LACTO doit contenir au minimum 7 colonnes (A à G).")
+        return df, find_supplier_boundaries_lacto, prepare_supplier_data_lacto
     else:  # coala
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
         if df.shape[1] < 8:
@@ -1544,13 +1721,15 @@ st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date
 
 st.divider()
 
-GL_OPTIONS = ["GL COALA", "GL PENNYLAND", "GL SAGE"]
+GL_OPTIONS = ["GL COALA", "GL PENNYLAND", "GL SAGE", "GL LACTO"]
 
 def _gl_label_to_format(label: str) -> str:
     if label == "GL PENNYLAND":
         return "pennyland"
     if label == "GL SAGE":
         return "sage"
+    if label == "GL LACTO":
+        return "lacto"
     return "coala"
 
 def _parse_journals(text: str) -> List[str]:
@@ -1622,7 +1801,7 @@ if not is_cheval:
         )
 
     sage_inv_j, sage_pay_j, sage_valid = [], [], True
-    if gl_fmt_label == "GL SAGE":
+    if gl_fmt_label in ("GL SAGE", "GL LACTO"):
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs("civile")
 
     if uploaded_file is not None:
@@ -1635,7 +1814,7 @@ if not is_cheval:
 
         selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
 
-        btn_disabled = (gl_fmt_label == "GL SAGE") and not sage_valid
+        btn_disabled = (gl_fmt_label in ("GL SAGE", "GL LACTO")) and not sage_valid
         if st.button("Lancer le traitement", type="primary", disabled=btn_disabled):
             try:
                 uploaded_file.seek(0)
@@ -1646,6 +1825,11 @@ if not is_cheval:
                     )
                 elif gl_fmt == "sage":
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_sage(
+                        uploaded_file, selected_sheet, reference_date, opening_date,
+                        sage_inv_j, sage_pay_j
+                    )
+                elif gl_fmt == "lacto":
+                    result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_lacto(
                         uploaded_file, selected_sheet, reference_date, opening_date,
                         sage_inv_j, sage_pay_j
                     )
@@ -1692,7 +1876,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N-1 : {e}")
         sage_inv_j1, sage_pay_j1, sage_valid1 = [], [], True
-        if gl_fmt1_label == "GL SAGE":
+        if gl_fmt1_label in ("GL SAGE", "GL LACTO"):
             sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs("cheval1")
 
     with col_f2:
@@ -1713,7 +1897,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N : {e}")
         sage_inv_j2, sage_pay_j2, sage_valid2 = [], [], True
-        if gl_fmt2_label == "GL SAGE":
+        if gl_fmt2_label in ("GL SAGE", "GL LACTO"):
             sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs("cheval2")
 
     both_ready = (
