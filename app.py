@@ -1531,7 +1531,7 @@ is_cheval = exercise_mode.startswith("Année à cheval")
 if not is_cheval:
     col_fmt, col_file = st.columns([1, 3])
     with col_fmt:
-        gl_fmt_label = st.radio("Format du grand livre", GL_OPTIONS, key="fmt_civile")
+        gl_fmt_label = st.selectbox("Format du grand livre", GL_OPTIONS, key="fmt_civile")
     with col_file:
         uploaded_file = st.file_uploader(
             f"Grand livre fournisseurs ({gl_fmt_label}) — Excel",
@@ -1591,7 +1591,7 @@ else:
 
     with col_f1:
         st.markdown(f"#### Grand livre — Année {int(selected_year) - 1}")
-        gl_fmt1_label = st.radio("Format GL (fichier N-1)", GL_OPTIONS, key="fmt1")
+        gl_fmt1_label = st.selectbox("Format GL (fichier N-1)", GL_OPTIONS, key="fmt1")
         file1 = st.file_uploader(
             f"Fichier {int(selected_year) - 1} ({gl_fmt1_label})",
             type=["xlsx", "xls"], key="file1",
@@ -1612,7 +1612,7 @@ else:
 
     with col_f2:
         st.markdown(f"#### Grand livre — Année {int(selected_year)}")
-        gl_fmt2_label = st.radio("Format GL (fichier N)", GL_OPTIONS, key="fmt2")
+        gl_fmt2_label = st.selectbox("Format GL (fichier N)", GL_OPTIONS, key="fmt2")
         file2 = st.file_uploader(
             f"Fichier {int(selected_year)} ({gl_fmt2_label})",
             type=["xlsx", "xls"], key="file2",
