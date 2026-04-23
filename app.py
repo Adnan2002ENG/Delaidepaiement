@@ -1035,6 +1035,28 @@ def _filter_by_year(rows: list, valid_years) -> list:
     return result
 
 
+def _collect_payments_only(boundary, supplier_df) -> list:
+    """Retourne les lignes de paiement (Débit > 0) **non lettrées** du fournisseur.
+    À utiliser uniquement si le fournisseur n'a aucune facture retenue dans le résultat.
+    """
+    has_piece = "PieceColD" in supplier_df.columns
+    has_libelle_e = "LibelleColE" in supplier_df.columns
+    mask = (supplier_df["Debit"] > 0) & (supplier_df["Lettrage"].fillna("") == "")
+    out = []
+    for _, r in supplier_df.loc[mask].iterrows():
+        out.append({
+            "Code fournisseur": boundary.supplier_code,
+            "Nom fournisseur": boundary.supplier_name,
+            "Date": r.get("DateOperation"),
+            "Journal": r.get("JournalColC", "") or "",
+            "N° pièce": (r.get("PieceColD", "") if has_piece else "") or "",
+            "Libellé": (r.get("LibelleColE", "") if has_libelle_e else "") or "",
+            "Lettrage": r.get("Lettrage", "") or "",
+            "Débit": float(r.get("Debit") or 0),
+        })
+    return out
+
+
 def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, opening_date: pd.Timestamp):
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
 
@@ -1048,6 +1070,7 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
     all_paid = []
     all_unpaid = []
     control_rows = []
+    all_payments_only = []
     year = reference_date.year
 
     for boundary in suppliers:
@@ -1062,7 +1085,10 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
         all_unpaid.extend(unpaid_rows)
         control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, reference_date=reference_date))
 
-    return _finalize_results(all_paid, all_unpaid, control_rows)
+        if not paid_rows and not unpaid_rows:
+            all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
+
+    return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
 def process_workbook_cheval(file1, sheet1, file2, sheet2,
@@ -1090,6 +1116,7 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
     all_paid = []
     all_unpaid = []
     control_rows = []
+    all_payments_only = []
 
     # Filtre : uniquement les factures de l'année choisie (N)
     year = reference_date.year
@@ -1125,7 +1152,10 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
         all_unpaid.extend(unpaid_rows)
         control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, year_filter=year, reference_date=reference_date))
 
-    return _finalize_results(all_paid, all_unpaid, control_rows)
+        if not paid_rows and not unpaid_rows:
+            all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
+
+    return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
 def process_workbook_pennyland(uploaded_file, sheet_name,
@@ -1144,6 +1174,7 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
     all_paid     = []
     all_unpaid   = []
     control_rows = []
+    all_payments_only = []
     year         = reference_date.year
 
     for boundary in suppliers:
@@ -1162,8 +1193,10 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
                                year_filter=year, gl_format="pennyland",
                                reference_date=reference_date)
         )
+        if not paid_rows and not unpaid_rows:
+            all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
 
-    return _finalize_results(all_paid, all_unpaid, control_rows)
+    return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
 def process_workbook_sage(uploaded_file, sheet_name,
@@ -1180,6 +1213,7 @@ def process_workbook_sage(uploaded_file, sheet_name,
         raise ValueError("Aucun fournisseur détecté dans le fichier GL SAGE.")
 
     all_paid, all_unpaid, control_rows = [], [], []
+    all_payments_only = []
     year = reference_date.year
 
     for boundary in suppliers:
@@ -1199,8 +1233,10 @@ def process_workbook_sage(uploaded_file, sheet_name,
                                reference_date=reference_date,
                                invoice_journals=invoice_journals)
         )
+        if not paid_rows and not unpaid_rows:
+            all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
 
-    return _finalize_results(all_paid, all_unpaid, control_rows)
+    return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
 def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
@@ -1233,6 +1269,7 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
     suppliers = find_fn(df)
     year       = reference_date.year
     all_paid, all_unpaid, ctrl = [], [], []
+    payments_only = []
 
     for boundary in suppliers:
         supplier_df = prep_fn(df, boundary, row_offset=row_offset)
@@ -1250,7 +1287,9 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
                                year_filter=year, gl_format=gl_fmt,
                                reference_date=reference_date)
         )
-    return all_paid, all_unpaid, ctrl
+        if not paid_rows and not unpaid_rows:
+            payments_only.extend(_collect_payments_only(boundary, supplier_df))
+    return all_paid, all_unpaid, ctrl, payments_only
 
 
 def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
@@ -1288,6 +1327,7 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
         combined_gl_format = gl_format1
 
         all_paid, all_unpaid, control_rows = [], [], []
+        all_payments_only = []
         year        = reference_date.year
         _min_y = _min_year()
         valid_years = set(range(_min_y, year + 1)) if year >= _min_y else {year}
@@ -1325,18 +1365,20 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
                                    reference_date=reference_date,
                                    invoice_journals=invoice_journals1)
             )
+            if not paid_rows and not unpaid_rows:
+                all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
 
-        return _finalize_results(all_paid, all_unpaid, control_rows)
+        return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
     # ── Formats différents (MIXED) : traitement indépendant par fichier ──────
     # Les lettrages COALA et PENNYLAND sont dans des systèmes distincts et ne
     # peuvent pas être mis en correspondance inter-fichiers.
     # Chaque fichier est traité séparément en mode civile + filtre année N.
-    paid1, unpaid1, ctrl1 = _process_one_file_cheval(
+    paid1, unpaid1, ctrl1, po1 = _process_one_file_cheval(
         df1, find_fn1, prep_fn1, gl_format1, reference_date, opening_date, row_offset=0,
         invoice_journals=invoice_journals1, payment_journals=payment_journals1
     )
-    paid2, unpaid2, ctrl2 = _process_one_file_cheval(
+    paid2, unpaid2, ctrl2, po2 = _process_one_file_cheval(
         df2, find_fn2, prep_fn2, gl_format2, reference_date, opening_date,
         row_offset=len(df1) + 10000,
         invoice_journals=invoice_journals2, payment_journals=payment_journals2
@@ -1345,13 +1387,18 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
     if not paid1 and not unpaid1 and not paid2 and not unpaid2:
         raise ValueError("Aucune facture de l'année choisie trouvée dans les deux fichiers.")
 
-    return _finalize_results(paid1 + paid2, unpaid1 + unpaid2, ctrl1 + ctrl2)
+    return _finalize_results(paid1 + paid2, unpaid1 + unpaid2, ctrl1 + ctrl2, po1 + po2)
 
 
-def _finalize_results(all_paid, all_unpaid, control_rows):
+def _finalize_results(all_paid, all_unpaid, control_rows, payments_only=None):
     paid_df = pd.DataFrame(all_paid)
     unpaid_df = pd.DataFrame(all_unpaid)
     control_df = pd.DataFrame(control_rows)
+    payments_only_df = pd.DataFrame(payments_only or [])
+    if not payments_only_df.empty:
+        payments_only_df = payments_only_df.sort_values(
+            by=["Code fournisseur", "Date"], na_position="last"
+        ).reset_index(drop=True)
 
     result_df = pd.concat([paid_df, unpaid_df], ignore_index=True)
     if not result_df.empty:
@@ -1360,17 +1407,22 @@ def _finalize_results(all_paid, all_unpaid, control_rows):
             na_position="last"
         ).reset_index(drop=True)
 
-    return result_df, paid_df, unpaid_df, control_df
+    return result_df, paid_df, unpaid_df, control_df, payments_only_df
 
 
 def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
-                   unpaid_df: pd.DataFrame, control_df: pd.DataFrame) -> bytes:
+                   unpaid_df: pd.DataFrame, control_df: pd.DataFrame,
+                   payments_only_df: pd.DataFrame = None) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         result_df.to_excel(writer, index=False, sheet_name="Resultat global")
         paid_df.to_excel(writer, index=False, sheet_name="Factures payees")
         unpaid_df.to_excel(writer, index=False, sheet_name="Factures non payees")
         control_df.to_excel(writer, index=False, sheet_name="Controle fournisseurs")
+        if payments_only_df is not None and not payments_only_df.empty:
+            payments_only_df.to_excel(
+                writer, index=False, sheet_name="Paiements sans facture"
+            )
 
         for sheet in writer.book.worksheets:
             for column_cells in sheet.columns:
@@ -1528,7 +1580,8 @@ def _sage_journal_inputs(key_prefix: str) -> Tuple[List[str], List[str], bool]:
         st.info("Renseignez au moins un journal facture et un journal paiement.")
     return inv, pay, valid
 
-def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = ""):
+def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = "",
+                  payments_only_df=None):
     st.success("Traitement terminé avec succès.")
     c1, c2, c3 = st.columns(3)
     c1.metric("Lignes payées", len(paid_df))
@@ -1538,7 +1591,14 @@ def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: 
     st.dataframe(result_df, use_container_width=True)
     st.subheader("Contrôle fournisseurs détectés")
     st.dataframe(control_df, use_container_width=True)
-    excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
+    if payments_only_df is not None and not payments_only_df.empty:
+        st.subheader("Paiements non lettrés — fournisseurs sans facture")
+        st.caption(
+            "Fournisseurs qui n'ont aucune facture dans la période. "
+            "Les opérations de paiement non lettrées sont listées ici pour information."
+        )
+        st.dataframe(payments_only_df, use_container_width=True)
+    excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df, payments_only_df)
     st.download_button(
         label="Télécharger le fichier résultat",
         data=excel_bytes,
@@ -1581,19 +1641,21 @@ if not is_cheval:
                 uploaded_file.seek(0)
                 gl_fmt = _gl_label_to_format(gl_fmt_label)
                 if gl_fmt == "pennyland":
-                    result_df, paid_df, unpaid_df, control_df = process_workbook_pennyland(
+                    result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_pennyland(
                         uploaded_file, selected_sheet, reference_date, opening_date
                     )
                 elif gl_fmt == "sage":
-                    result_df, paid_df, unpaid_df, control_df = process_workbook_sage(
+                    result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_sage(
                         uploaded_file, selected_sheet, reference_date, opening_date,
                         sage_inv_j, sage_pay_j
                     )
                 else:
-                    result_df, paid_df, unpaid_df, control_df = process_workbook(
+                    result_df, paid_df, unpaid_df, control_df, po_df = process_workbook(
                         uploaded_file, selected_sheet, reference_date, opening_date
                     )
-                _show_results(result_df, paid_df, unpaid_df, control_df, int(selected_year), suffix=quarter_suffix)
+                _show_results(result_df, paid_df, unpaid_df, control_df,
+                              int(selected_year), suffix=quarter_suffix,
+                              payments_only_df=po_df)
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
@@ -1667,7 +1729,7 @@ else:
             try:
                 file1.seek(0)
                 file2.seek(0)
-                result_df, paid_df, unpaid_df, control_df = process_workbook_cheval_generic(
+                result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_cheval_generic(
                     file1, sheet1, _gl_label_to_format(gl_fmt1_label),
                     file2, sheet2, _gl_label_to_format(gl_fmt2_label),
                     reference_date, opening_date,
@@ -1675,7 +1737,8 @@ else:
                     invoice_journals2=sage_inv_j2, payment_journals2=sage_pay_j2,
                 )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
-                              int(selected_year), suffix=f"_cheval{quarter_suffix}")
+                              int(selected_year), suffix=f"_cheval{quarter_suffix}",
+                              payments_only_df=po_df)
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
