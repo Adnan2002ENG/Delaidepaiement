@@ -996,25 +996,6 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
 
     total_credit_source = round(supplier_df.loc[mask, "Credit"].sum(), 2)
 
-    # Total débit (paiements) — pour détecter les fournisseurs "que paiements"
-    # ou "paiements > factures". On exclut les à-nouveau (opening_excl) et,
-    # pour SAGE, on se limite aux journaux de paiement déclarés par l'utilisateur.
-    if gl_format == "sage":
-        # supplier_df doit avoir été construit avec le même ctx, mais on ne
-        # connaît pas ici les payment_journals → on prend tous les débits hors A-nouveau.
-        pay_mask = (supplier_df["Debit"] > 0) & (~opening_excl)
-    else:
-        pay_mask = (supplier_df["Debit"] > 0) & (~opening_excl)
-    total_debit_source = round(supplier_df.loc[pay_mask, "Debit"].sum(), 2)
-
-    # Flag "que paiements" :
-    #   • soit aucune facture retenue mais des paiements existent
-    #   • soit les paiements excèdent strictement les factures retenues
-    payments_only = (
-        (total_debit_source > 0.01 and total_credit_source < 0.01)
-        or (total_debit_source > total_credit_source + 0.01)
-    )
-
     all_rows = paid_rows + unpaid_rows
     factures_reconstituees = {}
     for r in all_rows:
@@ -1030,11 +1011,9 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
         "Nb lignes payées": len(paid_rows),
         "Nb lignes non payées": len(unpaid_rows),
         "Total crédit source": total_credit_source,
-        "Total débit source": total_debit_source,
         "Total factures retenues": total_factures_retenues,
         "Écart": ecart,
         "Statut contrôle": "OK" if abs(ecart) < 0.01 else "Écart à analyser",
-        "_payments_only": payments_only,
     }
 
 
@@ -1370,38 +1349,9 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
 
 
 def _finalize_results(all_paid, all_unpaid, control_rows):
-    # --- Sépare les fournisseurs "que paiements / paiements > factures" -----
-    payments_only_codes = {
-        c.get("Code fournisseur")
-        for c in control_rows
-        if c.get("_payments_only")
-    }
-    payments_only_rows = [
-        c for c in control_rows if c.get("_payments_only")
-    ]
-    normal_control_rows = [
-        c for c in control_rows if not c.get("_payments_only")
-    ]
-
-    def _split(rows):
-        in_po, out_po = [], []
-        for r in rows:
-            (in_po if r.get("Code fournisseur") in payments_only_codes else out_po).append(r)
-        return out_po, in_po
-
-    all_paid,    paid_po    = _split(all_paid)
-    all_unpaid,  unpaid_po  = _split(all_unpaid)
-
-    # Nettoie la clé interne avant export
-    for c in normal_control_rows + payments_only_rows:
-        c.pop("_payments_only", None)
-
-    paid_df    = pd.DataFrame(all_paid)
-    unpaid_df  = pd.DataFrame(all_unpaid)
-    control_df = pd.DataFrame(normal_control_rows)
-
-    payments_only_detail_df = pd.DataFrame(paid_po + unpaid_po)
-    payments_only_control_df = pd.DataFrame(payments_only_rows)
+    paid_df = pd.DataFrame(all_paid)
+    unpaid_df = pd.DataFrame(all_unpaid)
+    control_df = pd.DataFrame(control_rows)
 
     result_df = pd.concat([paid_df, unpaid_df], ignore_index=True)
     if not result_df.empty:
@@ -1410,28 +1360,17 @@ def _finalize_results(all_paid, all_unpaid, control_rows):
             na_position="last"
         ).reset_index(drop=True)
 
-    return (result_df, paid_df, unpaid_df, control_df,
-            payments_only_detail_df, payments_only_control_df)
+    return result_df, paid_df, unpaid_df, control_df
 
 
 def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
-                   unpaid_df: pd.DataFrame, control_df: pd.DataFrame,
-                   payments_only_detail_df: pd.DataFrame = None,
-                   payments_only_control_df: pd.DataFrame = None) -> bytes:
+                   unpaid_df: pd.DataFrame, control_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         result_df.to_excel(writer, index=False, sheet_name="Resultat global")
         paid_df.to_excel(writer, index=False, sheet_name="Factures payees")
         unpaid_df.to_excel(writer, index=False, sheet_name="Factures non payees")
         control_df.to_excel(writer, index=False, sheet_name="Controle fournisseurs")
-        if payments_only_detail_df is not None and not payments_only_detail_df.empty:
-            payments_only_detail_df.to_excel(
-                writer, index=False, sheet_name="Frs paiements seuls"
-            )
-        if payments_only_control_df is not None and not payments_only_control_df.empty:
-            payments_only_control_df.to_excel(
-                writer, index=False, sheet_name="Controle paiements seuls"
-            )
 
         for sheet in writer.book.worksheets:
             for column_cells in sheet.columns:
@@ -1589,8 +1528,7 @@ def _sage_journal_inputs(key_prefix: str) -> Tuple[List[str], List[str], bool]:
         st.info("Renseignez au moins un journal facture et un journal paiement.")
     return inv, pay, valid
 
-def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = "",
-                  payments_only_detail_df=None, payments_only_control_df=None):
+def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = ""):
     st.success("Traitement terminé avec succès.")
     c1, c2, c3 = st.columns(3)
     c1.metric("Lignes payées", len(paid_df))
@@ -1600,17 +1538,7 @@ def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: 
     st.dataframe(result_df, use_container_width=True)
     st.subheader("Contrôle fournisseurs détectés")
     st.dataframe(control_df, use_container_width=True)
-    if payments_only_control_df is not None and not payments_only_control_df.empty:
-        st.subheader("Fournisseurs avec uniquement des paiements (ou paiements > factures)")
-        st.caption(
-            "Ces fournisseurs sont exclus du calcul de délai car ils n'ont "
-            "pas de facture correspondante (ou les paiements excèdent les factures)."
-        )
-        st.dataframe(payments_only_control_df, use_container_width=True)
-    excel_bytes = to_excel_bytes(
-        result_df, paid_df, unpaid_df, control_df,
-        payments_only_detail_df, payments_only_control_df
-    )
+    excel_bytes = to_excel_bytes(result_df, paid_df, unpaid_df, control_df)
     st.download_button(
         label="Télécharger le fichier résultat",
         data=excel_bytes,
@@ -1653,25 +1581,19 @@ if not is_cheval:
                 uploaded_file.seek(0)
                 gl_fmt = _gl_label_to_format(gl_fmt_label)
                 if gl_fmt == "pennyland":
-                    (result_df, paid_df, unpaid_df, control_df,
-                     po_detail_df, po_ctrl_df) = process_workbook_pennyland(
+                    result_df, paid_df, unpaid_df, control_df = process_workbook_pennyland(
                         uploaded_file, selected_sheet, reference_date, opening_date
                     )
                 elif gl_fmt == "sage":
-                    (result_df, paid_df, unpaid_df, control_df,
-                     po_detail_df, po_ctrl_df) = process_workbook_sage(
+                    result_df, paid_df, unpaid_df, control_df = process_workbook_sage(
                         uploaded_file, selected_sheet, reference_date, opening_date,
                         sage_inv_j, sage_pay_j
                     )
                 else:
-                    (result_df, paid_df, unpaid_df, control_df,
-                     po_detail_df, po_ctrl_df) = process_workbook(
+                    result_df, paid_df, unpaid_df, control_df = process_workbook(
                         uploaded_file, selected_sheet, reference_date, opening_date
                     )
-                _show_results(result_df, paid_df, unpaid_df, control_df,
-                              int(selected_year), suffix=quarter_suffix,
-                              payments_only_detail_df=po_detail_df,
-                              payments_only_control_df=po_ctrl_df)
+                _show_results(result_df, paid_df, unpaid_df, control_df, int(selected_year), suffix=quarter_suffix)
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
@@ -1745,8 +1667,7 @@ else:
             try:
                 file1.seek(0)
                 file2.seek(0)
-                (result_df, paid_df, unpaid_df, control_df,
-                 po_detail_df, po_ctrl_df) = process_workbook_cheval_generic(
+                result_df, paid_df, unpaid_df, control_df = process_workbook_cheval_generic(
                     file1, sheet1, _gl_label_to_format(gl_fmt1_label),
                     file2, sheet2, _gl_label_to_format(gl_fmt2_label),
                     reference_date, opening_date,
@@ -1754,9 +1675,7 @@ else:
                     invoice_journals2=sage_inv_j2, payment_journals2=sage_pay_j2,
                 )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
-                              int(selected_year), suffix=f"_cheval{quarter_suffix}",
-                              payments_only_detail_df=po_detail_df,
-                              payments_only_control_df=po_ctrl_df)
+                              int(selected_year), suffix=f"_cheval{quarter_suffix}")
             except Exception as e:
                 st.error(f"Erreur pendant le traitement : {e}")
     else:
