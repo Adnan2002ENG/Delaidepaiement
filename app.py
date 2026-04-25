@@ -195,19 +195,86 @@ def extract_invoice_number(piece_text: str, libelle_text: str) -> str:
     return ""
 
 
+def _norm_header(s: str) -> str:
+    """Normalise un en-tête pour comparaison robuste (accents, casse, espaces, ponctuation)."""
+    s = str(s or "").lower()
+    repl = (("é","e"),("è","e"),("ê","e"),("à","a"),("ô","o"),("ç","c"),
+            ("°",""),("'",""),("'",""),("’",""),(" ",""),(".",""),("/",""),
+            ("(",""),(")",""),("-",""),("_",""))
+    for a, b in repl:
+        s = s.replace(a, b)
+    return s
+
+
+def _resolve_pennyland_cols(df: pd.DataFrame) -> dict:
+    """Résout dynamiquement les indices de colonnes PENNYLANE par nom d'en-tête.
+    Tolère les variations de schéma (ex : insertion de colonnes 'Libellé de ligne',
+    'Taux d'attribution TVA' qui décalent Débit/Crédit). Fallback sur l'ancien
+    layout fixe si la résolution échoue.
+    """
+    cols = list(df.columns)
+    cols_n = [_norm_header(c) for c in cols]
+
+    def find(*needles, allow_substring: bool = True) -> Optional[int]:
+        needs = [_norm_header(n) for n in needles]
+        # match exact prioritaire
+        for n in needs:
+            for i, cn in enumerate(cols_n):
+                if cn == n:
+                    return i
+        if not allow_substring:
+            return None
+        # match par sous-chaîne
+        for n in needs:
+            for i, cn in enumerate(cols_n):
+                if n and n in cn:
+                    return i
+        return None
+
+    out = {
+        "account":     find("ndecompte", "ncompte", "ndcompte"),
+        "name":        find("libelledecompte", "libellecompte"),
+        "date":        find("date", allow_substring=False),  # exact pour éviter "dateenregistrement"
+        "journal":     find("journal"),
+        "libelle":     find("libelledepiece", "libellepiece", "libelledeligne", "libelleligne"),
+        "num_facture": find("ndefacture", "nfacture", "numerodefacture"),
+        "lettrage":    find("let", "lettrage", "let.", allow_substring=False),
+        "debit":       find("debit", allow_substring=False),
+        "credit":      find("credit", allow_substring=False),
+    }
+    # Fallback ancien layout
+    defaults = {"account":0,"name":1,"date":2,"journal":3,"libelle":4,
+                "num_facture":7,"lettrage":9,"debit":10,"credit":11}
+    for k, v in out.items():
+        if v is None or v < 0:
+            out[k] = defaults[k]
+    return out
+
+
+def _pl_cols(df: pd.DataFrame) -> dict:
+    """Retourne (et cache) le mapping de colonnes pour un DataFrame PENNYLANE."""
+    cached = df.attrs.get("_pl_cols")
+    if cached is not None:
+        return cached
+    out = _resolve_pennyland_cols(df)
+    df.attrs["_pl_cols"] = out
+    return out
+
+
 def find_supplier_boundaries_pennyland(df: pd.DataFrame) -> List[SupplierBoundary]:
     """Détecte les fournisseurs dans un GL Pennyland.
     Chaque groupe de lignes consécutives partageant le même N° de compte = un fournisseur.
-    Le fichier doit être lu avec header=1 (la ligne 0 blank est sautée automatiquement).
+    Les indices de colonnes sont résolus par nom (robuste aux variations de schéma).
     """
+    ci = _pl_cols(df)
     suppliers = []
     current_account = None
     current_name = None
     start_row = None
 
     for idx in range(len(df)):
-        account = normalize_text(df.iat[idx, PENNYLAND_COL_INDEX["account"]])
-        name    = normalize_text(df.iat[idx, PENNYLAND_COL_INDEX["name"]])
+        account = normalize_text(df.iat[idx, ci["account"]])
+        name    = normalize_text(df.iat[idx, ci["name"]])
 
         # Ignorer lignes vides / NaN
         if not account or account.lower() in ("nan", ""):
@@ -257,7 +324,7 @@ def prepare_supplier_data_pennyland(df: pd.DataFrame, boundary: SupplierBoundary
     supplier_df["original_row"] = supplier_df["original_row"] + row_offset
 
     # +1 sur chaque index car reset_index() a inséré la colonne "original_row" en position 0
-    ci = PENNYLAND_COL_INDEX
+    ci = _pl_cols(df)
 
     result = pd.DataFrame()
     result["original_row"] = supplier_df["original_row"]
@@ -714,11 +781,18 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
         )
 
     # --- Masques journaux (factures / paiements) ---
+    inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
+    pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
     if gl_format in ("sage", "lacto"):
-        inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
-        pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
-        # Inclure AA/AD/AN pour 2025+ même si l'utilisateur ne les a pas listés
+        # SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+        pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
+    elif gl_format == "pennyland" and (inv_j or pay_j):
+        # PENNYLANE : journaux saisis (facultatifs). Si non fournis → comportement historique.
+        inv_journal_mask = (
+            journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+            if inv_j else journals_upper.str.startswith("A", na=False)
+        )
         pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
     else:
         inv_journal_mask = journals_upper.str.startswith("A", na=False)
@@ -1101,9 +1175,11 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
     opening_excl = opening_excl & ~_is_min_plus.fillna(False)
 
-    # Masque journaux factures (SAGE + LACTO : journaux déclarés par l'utilisateur)
+    # Masque journaux factures (SAGE/LACTO obligatoire ; PENNYLANE optionnel)
+    inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
     if gl_format in ("sage", "lacto"):
-        inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
+        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+    elif gl_format == "pennyland" and inv_j:
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
     else:
         inv_journal_mask = pd.Series(True, index=supplier_df.index)
@@ -1283,11 +1359,43 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
     return _finalize_results(all_paid, all_unpaid, control_rows, all_payments_only)
 
 
+def _read_pennyland(uploaded_file, sheet_name) -> pd.DataFrame:
+    """Lit un GL Pennylane en détectant automatiquement la ligne d'en-tête (0 ou 1).
+    Le format récent place les en-têtes en ligne 0 ; un export plus ancien les place
+    en ligne 1 (1ère ligne vide ou titre). On accepte les deux.
+    """
+    last_df = None
+    for h in (0, 1):
+        try:
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=h)
+        except Exception:
+            continue
+        last_df = df
+        cols_n = [_norm_header(c) for c in df.columns]
+        has_compte = any(("ndecompte" == c) or ("ncompte" == c) or ("compte" in c)
+                         for c in cols_n)
+        has_debit  = any(c == "debit" for c in cols_n)
+        if has_compte and has_debit:
+            return df
+    if last_df is None:
+        raise ValueError("Impossible de lire le fichier GL Pennylane.")
+    return last_df
+
+
 def process_workbook_pennyland(uploaded_file, sheet_name,
-                                reference_date: pd.Timestamp, opening_date: pd.Timestamp):
-    """Traitement GL Pennyland – mode Année civile."""
-    # header=1 : saute la 1ère ligne vide de l'export Pennyland et utilise la 2ème comme en-tête
-    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+                                reference_date: pd.Timestamp, opening_date: pd.Timestamp,
+                                invoice_journals: Optional[List[str]] = None,
+                                payment_journals: Optional[List[str]] = None):
+    """Traitement GL Pennyland – mode Année civile.
+    Les journaux facture/paiement peuvent être saisis par l'utilisateur (même
+    principe que SAGE) ; à défaut, comportement historique (factures = journaux
+    commençant par 'A').
+    """
+    df = _read_pennyland(uploaded_file, sheet_name)
 
     if df.shape[1] < 12:
         raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
@@ -1306,7 +1414,8 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
         supplier_df = prepare_supplier_data_pennyland(df, boundary)
         paid_rows, unpaid_rows = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
-            mode="civile", year_filter=year, gl_format="pennyland"
+            mode="civile", year_filter=year, gl_format="pennyland",
+            invoice_journals=invoice_journals, payment_journals=payment_journals
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1316,7 +1425,8 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
         control_rows.append(
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                year_filter=year, gl_format="pennyland",
-                               reference_date=reference_date)
+                               reference_date=reference_date,
+                               invoice_journals=invoice_journals)
         )
         if not paid_rows and not unpaid_rows:
             all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1414,7 +1524,7 @@ def process_workbook_lacto(uploaded_file, sheet_name,
 def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
     """Lit un fichier Excel selon le format GL et retourne (df, find_boundaries_fn, prepare_fn)."""
     if gl_format == "pennyland":
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+        df = _read_pennyland(uploaded_file, sheet_name)
         if df.shape[1] < 12:
             raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
         return df, find_supplier_boundaries_pennyland, prepare_supplier_data_pennyland
@@ -1738,25 +1848,37 @@ def _parse_journals(text: str) -> List[str]:
         return []
     return [j.strip().upper() for j in text.split(",") if j.strip()]
 
-def _sage_journal_inputs(key_prefix: str) -> Tuple[List[str], List[str], bool]:
-    """Affiche les deux champs journaux pour SAGE et retourne (inv, pay, is_valid)."""
-    st.caption("Format GL SAGE : précisez les codes journaux (séparez par virgule).")
+def _sage_journal_inputs(key_prefix: str, *, fmt_label: str = "GL SAGE",
+                          required: bool = True) -> Tuple[List[str], List[str], bool]:
+    """Affiche les deux champs journaux et retourne (inv, pay, is_valid).
+    `required=False` autorise les champs vides (ex : Pennylane facultatif).
+    """
+    if required:
+        st.caption(f"Format {fmt_label} : précisez les codes journaux (séparez par virgule).")
+    else:
+        st.caption(
+            f"Format {fmt_label} : journaux **facultatifs** (séparez par virgule). "
+            "Laisser vide pour le comportement par défaut."
+        )
     col_j1, col_j2 = st.columns(2)
     with col_j1:
         inv_text = st.text_input(
-            "Journaux des factures (ex: `OD` ou `OD,VE,AC`)",
+            "Journaux des factures (ex: `AC` ou `AC,OD`)",
             key=f"{key_prefix}_inv_j",
         )
     with col_j2:
         pay_text = st.text_input(
-            "Journaux des paiements (ex: `BQ` ou `BQ,CA`)",
+            "Journaux des paiements (ex: `BQ1` ou `BQ1,BQ2`)",
             key=f"{key_prefix}_pay_j",
         )
     inv = _parse_journals(inv_text)
     pay = _parse_journals(pay_text)
-    valid = bool(inv) and bool(pay)
-    if not valid:
-        st.info("Renseignez au moins un journal facture et un journal paiement.")
+    if required:
+        valid = bool(inv) and bool(pay)
+        if not valid:
+            st.info("Renseignez au moins un journal facture et un journal paiement.")
+    else:
+        valid = True
     return inv, pay, valid
 
 def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = "",
@@ -1802,7 +1924,13 @@ if not is_cheval:
 
     sage_inv_j, sage_pay_j, sage_valid = [], [], True
     if gl_fmt_label in ("GL SAGE", "GL LACTO"):
-        sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs("civile")
+        sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
+            "civile", fmt_label=gl_fmt_label, required=True
+        )
+    elif gl_fmt_label == "GL PENNYLAND":
+        sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
+            "civile", fmt_label="GL PENNYLAND", required=False
+        )
 
     if uploaded_file is not None:
         try:
@@ -1821,7 +1949,8 @@ if not is_cheval:
                 gl_fmt = _gl_label_to_format(gl_fmt_label)
                 if gl_fmt == "pennyland":
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_pennyland(
-                        uploaded_file, selected_sheet, reference_date, opening_date
+                        uploaded_file, selected_sheet, reference_date, opening_date,
+                        invoice_journals=sage_inv_j, payment_journals=sage_pay_j
                     )
                 elif gl_fmt == "sage":
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_sage(
@@ -1877,7 +2006,13 @@ else:
                 st.error(f"Impossible de lire le fichier N-1 : {e}")
         sage_inv_j1, sage_pay_j1, sage_valid1 = [], [], True
         if gl_fmt1_label in ("GL SAGE", "GL LACTO"):
-            sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs("cheval1")
+            sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
+                "cheval1", fmt_label=gl_fmt1_label, required=True
+            )
+        elif gl_fmt1_label == "GL PENNYLAND":
+            sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
+                "cheval1", fmt_label="GL PENNYLAND", required=False
+            )
 
     with col_f2:
         st.markdown(f"#### Grand livre — Année {int(selected_year)}")
@@ -1898,7 +2033,13 @@ else:
                 st.error(f"Impossible de lire le fichier N : {e}")
         sage_inv_j2, sage_pay_j2, sage_valid2 = [], [], True
         if gl_fmt2_label in ("GL SAGE", "GL LACTO"):
-            sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs("cheval2")
+            sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
+                "cheval2", fmt_label=gl_fmt2_label, required=True
+            )
+        elif gl_fmt2_label == "GL PENNYLAND":
+            sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
+                "cheval2", fmt_label="GL PENNYLAND", required=False
+            )
 
     both_ready = (
         file1 is not None and file2 is not None
