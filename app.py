@@ -838,52 +838,9 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             if pay_group.empty:
                 continue
 
-            # ---- MODE À CHEVAL : gestion des paiements cross-année ----
-            if mode == "cheval" and has_source_file:
-                inv_files = set(inv_group["source_file"].unique())
-                pay_group_same = pay_group[pay_group["source_file"].isin(inv_files)].copy()
-
-                if pay_group_same.empty:
-                    # Pas de paiement de la même année que la facture
-                    # Vérifier s'il existe un paiement de l'année N-1 (fichier antérieur)
-                    min_inv_file = min(inv_files)
-                    pay_group_prev = pay_group[pay_group["source_file"] < min_inv_file].copy()
-
-                    if not pay_group_prev.empty:
-                        # Paiement de l'année N-1 : facture payée EN AVANCE
-                        # Le délai sera négatif → classify_remark → "Rien à signaler"
-                        pay_group = pay_group_prev
-                        # On continue vers l'allocation FIFO normale ci-dessous
-                    else:
-                        # Aucun paiement trouvé dans les fichiers N-1 et N
-                        # → le paiement est de l'année N+1 : facture non payée à la clôture
-                        for _, inv in inv_group.iterrows():
-                            invoice_date = inv["DateOperation"]
-                            invoice_total = round(inv["Credit"], 2)
-                            delay_days = (
-                                None if pd.isna(invoice_date)
-                                else int((reference_date - invoice_date).days + 1)
-                            )
-                            unpaid_rows.append({
-                                "Code fournisseur": boundary.supplier_code,
-                                "Nom fournisseur": boundary.supplier_name,
-                                "Libellé": inv["LibelleColE"],
-                                "Numero facture": inv["NumeroFacture"],
-                                "Type": "Facture non payée (paiement année suivante)",
-                                "Journal": inv["JournalColC"],
-                                "Lettrage": letter,
-                                "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-                                "Date paiement": None,
-                                "Montant facture": invoice_total,
-                                "Montant(s) paiement(s) total": 0.0,
-                                "Montant facture origine": invoice_total,
-                                "Délai (jours)": delay_days,
-                                "Remarque": classify_remark(delay_days),
-                                "Ligne source facture": int(inv["original_row"]) + 2,
-                            })
-                        continue
-                else:
-                    pay_group = pay_group_same
+            # ---- MODE À CHEVAL : on garde TOUS les paiements lettrés ----
+            # Une facture lettrée est forcément payée : on utilise le paiement
+            # disponible quel qu'il soit (même année, année antérieure ou suivante).
             # ---- FIN MODE À CHEVAL ----
 
             inv_group = inv_group.sort_values(by=["DateOperation", "original_row"], na_position="last")
@@ -900,33 +857,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 invoice_date = inv["DateOperation"]
                 payment_date = pay["DateOperation"]
 
-                # ── Paiement APRÈS la date de clôture (31/12/N) ──────────────────
-                # La facture est considérée NON PAYÉE à la clôture.
-                # Délai = 31/12/N − date_facture + 1
-                if pd.notna(payment_date) and payment_date > reference_date:
-                    clot_delay = (
-                        None if pd.isna(invoice_date)
-                        else int((reference_date - invoice_date).days + 1)
-                    )
-                    unpaid_rows.append({
-                        "Code fournisseur": boundary.supplier_code,
-                        "Nom fournisseur": boundary.supplier_name,
-                        "Libellé": inv["LibelleColE"],
-                        "Numero facture": inv["NumeroFacture"],
-                        "Type": "Facture non payée (paiement après clôture)",
-                        "Journal": inv["JournalColC"],
-                        "Lettrage": letter,
-                        "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
-                        "Date paiement": None,
-                        "Montant facture": round(allocated_amount, 2),
-                        "Montant(s) paiement(s) total": 0.0,
-                        "Montant facture origine": round(invoice_total, 2),
-                        "Délai (jours)": clot_delay,
-                        "Remarque": classify_remark(clot_delay),
-                        "Ligne source facture": int(inv["original_row"]) + 2,
-                    })
-                    continue  # ne pas ajouter aux paid_rows
-                # ── Paiement dans l'année (ou date invalide) ─────────────────────
+                # ── Paiement dans l'année OU après clôture : facture payée ───────
                 if pd.isna(invoice_date) or pd.isna(payment_date):
                     delay_days = None
                     remark = "Date facture ou date paiement invalide"
