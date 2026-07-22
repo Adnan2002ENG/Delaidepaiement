@@ -65,6 +65,10 @@ SAGE_COL_INDEX = {
 # L'UI peut la descendre à 2024 via la checkbox "Inclure les factures 2024".
 MIN_INVOICE_YEAR = 2025
 
+# Type de ligne : facture soldée par un paiement non lettré rapproché en FIFO.
+# Ces lignes sont extraites des "non payées" vers leur propre feuille de résultat.
+FIFO_PAID_TYPE = "Paiement non lettré imputé FIFO"
+
 
 def _min_year() -> int:
     try:
@@ -752,7 +756,8 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                      gl_format: str = "coala",
                      invoice_journals: Optional[List[str]] = None,
                      payment_journals: Optional[List[str]] = None,
-                     is_quarterly: bool = False):
+                     is_quarterly: bool = False,
+                     quarter_start: Optional[pd.Timestamp] = None):
     """
     gl_format : "coala"    → détection solde ouverture via LibelleColA, allocation FIFO
                 "pennyland" → détection solde ouverture via JournalColC=="AA", allocation par montant
@@ -763,6 +768,23 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     unpaid_rows = []
 
     has_source_file = "source_file" in supplier_df.columns
+
+    def _quarter_class(payment_date):
+        """En déclaration trimestrielle, situe un paiement par rapport au trimestre :
+          • 'before' : payé AVANT le début du trimestre (quarter_start) → réglé sur un
+                       trimestre antérieur → hors périmètre de cette déclaration (exclu).
+          • 'after'  : payé APRÈS la clôture (reference_date) → facture NON PAYÉE à la clôture.
+          • 'in'     : payé pendant le trimestre → facture PAYÉE.
+        En annuel (is_quarterly=False) : toujours 'in'.
+        """
+        if not is_quarterly:
+            return "in"
+        if pd.notna(payment_date):
+            if quarter_start is not None and payment_date < quarter_start:
+                return "before"
+            if payment_date > reference_date:
+                return "after"
+        return "in"
 
     # --- Masque solde d'ouverture (varie selon le format) ---
     # "mixed" = un fichier COALA + un fichier PENNYLAND → on combine les deux détections
@@ -858,10 +880,17 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 invoice_date = inv["DateOperation"]
                 payment_date = pay["DateOperation"]
 
-                # ── MODE TRIMESTRIEL : paiement après la date de fin de trimestre ─
-                # → facture considérée NON PAYÉE à la clôture du trimestre.
+                # ── MODE TRIMESTRIEL : situer le paiement par rapport au trimestre ─
+                _qc = _quarter_class(payment_date)
+
+                # Payé AVANT le début du trimestre → réglé sur un trimestre
+                # antérieur → hors périmètre de cette déclaration.
+                if _qc == "before":
+                    continue
+
+                # Payé APRÈS la clôture → facture NON PAYÉE à la clôture du trimestre.
                 # Délai = reference_date − date_facture + 1
-                if is_quarterly and pd.notna(payment_date) and payment_date > reference_date:
+                if _qc == "after":
                     clot_delay = (
                         None if pd.isna(invoice_date)
                         else int((reference_date - invoice_date).days + 1)
@@ -962,6 +991,13 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             else:
                 delay_days = int((opening_date - invoice_date).days + 1)
 
+            # Trimestriel : l'avance d'ouverture (date = ouverture) est réglée avant
+            # le début du trimestre → hors périmètre. On consomme la facture (pour ne
+            # pas la relister en non payée) sans l'émettre comme payée.
+            if _quarter_class(opening_date) == "before":
+                consumed_invoice_ids.add(int(inv["original_row"]))
+                continue
+
             unpaid_rows.append({
                 "Code fournisseur": boundary.supplier_code,
                 "Nom fournisseur": boundary.supplier_name,
@@ -1016,6 +1052,11 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             invoice_date = inv["DateOperation"]
             payment_date = pay["DateOperation"]
 
+            # Trimestriel : payé AVANT le début du trimestre → hors déclaration.
+            # (les paiements non lettrés sont déjà filtrés ≤ clôture → pas de cas 'after' ici)
+            if _quarter_class(payment_date) == "before":
+                continue
+
             if pd.isna(invoice_date) or pd.isna(payment_date):
                 delay_days = None
                 remark = "Date facture ou date paiement invalide"
@@ -1028,7 +1069,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 "Nom fournisseur": boundary.supplier_name,
                 "Libellé": inv["LibelleColE"],
                 "Numero facture": inv["NumeroFacture"],
-                "Type": "Paiement non lettré imputé FIFO",
+                "Type": FIFO_PAID_TYPE,
                 "Journal": inv["JournalColC"],
                 "Lettrage": "",
                 "Date facture": invoice_date.date() if pd.notna(invoice_date) else None,
@@ -1213,12 +1254,13 @@ def _collect_payments_only(boundary, supplier_df) -> list:
             "Libellé": (r.get("LibelleColE", "") if has_libelle_e else "") or "",
             "Lettrage": r.get("Lettrage", "") or "",
             "Débit": float(r.get("Debit") or 0),
+            "Remarque": "Avance",
         })
     return out
 
 
 def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, opening_date: pd.Timestamp,
-                     is_quarterly: bool = False):
+                     is_quarterly: bool = False, quarter_start: Optional[pd.Timestamp] = None):
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
 
     if df.shape[1] < 8:
@@ -1237,7 +1279,8 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
     for boundary in suppliers:
         supplier_df = prepare_supplier_data(df, boundary)
         paid_rows, unpaid_rows = process_supplier(boundary, supplier_df, reference_date, opening_date,
-                                                   mode="civile", year_filter=year, is_quarterly=is_quarterly)
+                                                   mode="civile", year_filter=year, is_quarterly=is_quarterly,
+                                                   quarter_start=quarter_start)
 
         # Filtre final : on ne garde que les factures de l'année choisie
         paid_rows = _filter_by_year(paid_rows, year)
@@ -1347,11 +1390,39 @@ def _read_pennyland(uploaded_file, sheet_name) -> pd.DataFrame:
     return last_df
 
 
+def _read_sage(uploaded_file, sheet_name) -> pd.DataFrame:
+    """Lit un GL SAGE en détectant automatiquement la ligne d'en-tête (0 ou 1).
+    Certains exports placent un titre en ligne 0 (en-tête réel en ligne 1),
+    d'autres mettent l'en-tête « COMPTE / DATE / ... / DEBIT / CREDIT »
+    directement en ligne 0. On accepte les deux pour ne perdre aucune ligne.
+    """
+    last_df = None
+    for h in (0, 1):
+        try:
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=h)
+        except Exception:
+            continue
+        last_df = df
+        cols_n = [_norm_header(c) for c in df.columns]
+        has_compte  = any("compte" in c for c in cols_n)
+        has_montant = any(c in ("debit", "credit") for c in cols_n)
+        if has_compte and has_montant:
+            return df
+    if last_df is None:
+        raise ValueError("Impossible de lire le fichier GL SAGE.")
+    return last_df
+
+
 def process_workbook_pennyland(uploaded_file, sheet_name,
                                 reference_date: pd.Timestamp, opening_date: pd.Timestamp,
                                 invoice_journals: Optional[List[str]] = None,
                                 payment_journals: Optional[List[str]] = None,
-                                is_quarterly: bool = False):
+                                is_quarterly: bool = False,
+                                quarter_start: Optional[pd.Timestamp] = None):
     """Traitement GL Pennyland – mode Année civile.
     Les journaux facture/paiement peuvent être saisis par l'utilisateur (même
     principe que SAGE) ; à défaut, comportement historique (factures = journaux
@@ -1378,7 +1449,7 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="pennyland",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
-            is_quarterly=is_quarterly,
+            is_quarterly=is_quarterly, quarter_start=quarter_start,
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1400,9 +1471,10 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
 def process_workbook_sage(uploaded_file, sheet_name,
                            reference_date: pd.Timestamp, opening_date: pd.Timestamp,
                            invoice_journals: List[str], payment_journals: List[str],
-                           is_quarterly: bool = False):
+                           is_quarterly: bool = False,
+                           quarter_start: Optional[pd.Timestamp] = None):
     """Traitement GL SAGE – mode Année civile."""
-    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+    df = _read_sage(uploaded_file, sheet_name)
 
     if df.shape[1] < 8:
         raise ValueError("Le fichier GL SAGE doit contenir au minimum 8 colonnes (A à H).")
@@ -1421,7 +1493,7 @@ def process_workbook_sage(uploaded_file, sheet_name,
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="sage",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
-            is_quarterly=is_quarterly,
+            is_quarterly=is_quarterly, quarter_start=quarter_start,
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1442,7 +1514,8 @@ def process_workbook_sage(uploaded_file, sheet_name,
 def process_workbook_lacto(uploaded_file, sheet_name,
                             reference_date: pd.Timestamp, opening_date: pd.Timestamp,
                             invoice_journals: List[str], payment_journals: List[str],
-                            is_quarterly: bool = False):
+                            is_quarterly: bool = False,
+                            quarter_start: Optional[pd.Timestamp] = None):
     """Traitement GL LACTO – mode Année civile.
     En-têtes fournisseur en col A (préfixe '4411'), colonne A = lettrage
     pour les lignes d'opération. Journaux facture/paiement saisis par
@@ -1470,7 +1543,7 @@ def process_workbook_lacto(uploaded_file, sheet_name,
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="lacto",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
-            is_quarterly=is_quarterly,
+            is_quarterly=is_quarterly, quarter_start=quarter_start,
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1496,7 +1569,7 @@ def _read_file_by_format(uploaded_file, sheet_name: str, gl_format: str):
             raise ValueError("Le fichier GL Pennyland doit contenir au minimum 12 colonnes.")
         return df, find_supplier_boundaries_pennyland, prepare_supplier_data_pennyland
     elif gl_format == "sage":
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=1)
+        df = _read_sage(uploaded_file, sheet_name)
         if df.shape[1] < 8:
             raise ValueError("Le fichier GL SAGE doit contenir au minimum 8 colonnes (A à H).")
         return df, find_supplier_boundaries_sage, prepare_supplier_data_sage
@@ -1517,7 +1590,8 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
                               row_offset: int = 0,
                               invoice_journals: Optional[List[str]] = None,
                               payment_journals: Optional[List[str]] = None,
-                              is_quarterly: bool = False):
+                              is_quarterly: bool = False,
+                              quarter_start: Optional[pd.Timestamp] = None):
     """Traite un seul fichier en mode cheval (année civile avec filtre + règle paiement post-clôture).
     Utilisé pour le mode MIXED où les deux fichiers ont des formats différents.
     """
@@ -1532,7 +1606,7 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format=gl_fmt,
             invoice_journals=invoice_journals, payment_journals=payment_journals,
-            is_quarterly=is_quarterly,
+            is_quarterly=is_quarterly, quarter_start=quarter_start,
         )
         paid_rows   = _filter_by_year(paid_rows,   year)
         unpaid_rows = _filter_by_year(unpaid_rows, year)
@@ -1555,7 +1629,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
                                      payment_journals1: Optional[List[str]] = None,
                                      invoice_journals2: Optional[List[str]] = None,
                                      payment_journals2: Optional[List[str]] = None,
-                                     is_quarterly: bool = False):
+                                     is_quarterly: bool = False,
+                                     quarter_start: Optional[pd.Timestamp] = None):
     """Traitement Année à cheval générique : chaque fichier peut être COALA ou PENNYLAND.
 
     • Même format (COALA+COALA ou PENNYLAND+PENNYLAND) :
@@ -1610,7 +1685,7 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
                 boundary, supplier_df, reference_date, opening_date,
                 mode="cheval", year_filter=None, gl_format=combined_gl_format,
                 invoice_journals=invoice_journals1, payment_journals=payment_journals1,
-                is_quarterly=is_quarterly,
+                is_quarterly=is_quarterly, quarter_start=quarter_start,
             )
             paid_rows   = _filter_by_year(paid_rows,   valid_years)
             unpaid_rows = _filter_by_year(unpaid_rows, valid_years)
@@ -1635,19 +1710,37 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
     paid1, unpaid1, ctrl1, po1 = _process_one_file_cheval(
         df1, find_fn1, prep_fn1, gl_format1, reference_date, opening_date, row_offset=0,
         invoice_journals=invoice_journals1, payment_journals=payment_journals1,
-        is_quarterly=is_quarterly,
+        is_quarterly=is_quarterly, quarter_start=quarter_start,
     )
     paid2, unpaid2, ctrl2, po2 = _process_one_file_cheval(
         df2, find_fn2, prep_fn2, gl_format2, reference_date, opening_date,
         row_offset=len(df1) + 10000,
         invoice_journals=invoice_journals2, payment_journals=payment_journals2,
-        is_quarterly=is_quarterly,
+        is_quarterly=is_quarterly, quarter_start=quarter_start,
     )
 
     if not paid1 and not unpaid1 and not paid2 and not unpaid2:
         raise ValueError("Aucune facture de l'année choisie trouvée dans les deux fichiers.")
 
     return _finalize_results(paid1 + paid2, unpaid1 + unpaid2, ctrl1 + ctrl2, po1 + po2)
+
+
+def _split_fifo_rows(unpaid_df: pd.DataFrame):
+    """Sépare les factures payées par FIFO du reste des lignes non payées.
+
+    Retourne (fifo_df, real_unpaid_df) :
+      • fifo_df        : lignes dont Type == FIFO_PAID_TYPE (factures soldées par un
+                         paiement non lettré rapproché en FIFO) → feuille dédiée.
+      • real_unpaid_df : tout le reste (reliquat vraiment non payé, avances imputées,
+                         factures non payées) → feuille « Factures non payées ».
+    """
+    empty = pd.DataFrame()
+    if unpaid_df is None or unpaid_df.empty or "Type" not in unpaid_df.columns:
+        return empty, (unpaid_df if unpaid_df is not None else empty)
+    is_fifo = unpaid_df["Type"] == FIFO_PAID_TYPE
+    fifo_df = unpaid_df[is_fifo].reset_index(drop=True)
+    real_unpaid_df = unpaid_df[~is_fifo].reset_index(drop=True)
+    return fifo_df, real_unpaid_df
 
 
 def _finalize_results(all_paid, all_unpaid, control_rows, payments_only=None):
@@ -1675,9 +1768,12 @@ def to_excel_bytes(result_df: pd.DataFrame, paid_df: pd.DataFrame,
                    payments_only_df: pd.DataFrame = None) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        fifo_df, real_unpaid_df = _split_fifo_rows(unpaid_df)
         result_df.to_excel(writer, index=False, sheet_name="Resultat global")
         paid_df.to_excel(writer, index=False, sheet_name="Factures payees")
-        unpaid_df.to_excel(writer, index=False, sheet_name="Factures non payees")
+        if fifo_df is not None and not fifo_df.empty:
+            fifo_df.to_excel(writer, index=False, sheet_name="Factures payees FIFO")
+        real_unpaid_df.to_excel(writer, index=False, sheet_name="Factures non payees")
         control_df.to_excel(writer, index=False, sheet_name="Controle fournisseurs")
         if payments_only_df is not None and not payments_only_df.empty:
             payments_only_df.to_excel(
@@ -1781,6 +1877,16 @@ QUARTER_END_DATES = {
     "T4 — 4ème trimestre (31/12)": f"{int(selected_year)}-12-31",
 }
 
+# Début de chaque trimestre (borne basse) : en déclaration trimestrielle, seules
+# les factures payées DANS le trimestre sont retenues ; celles payées avant sont
+# rattachées à un trimestre antérieur → exclues.
+QUARTER_START_DATES = {
+    "T1 — 1er trimestre (31/03)":  f"{int(selected_year)}-01-01",
+    "T2 — 2ème trimestre (30/06)": f"{int(selected_year)}-04-01",
+    "T3 — 3ème trimestre (30/09)": f"{int(selected_year)}-07-01",
+    "T4 — 4ème trimestre (31/12)": f"{int(selected_year)}-10-01",
+}
+
 col_decl, col_trim = st.columns([1, 2])
 with col_decl:
     decl_type = st.radio(
@@ -1790,17 +1896,27 @@ with col_decl:
     )
 
 quarter_suffix = ""
+quarter_start = None   # borne basse (déclaration trimestrielle uniquement)
 with col_trim:
     if decl_type == "Trimestrielle":
         selected_quarter = st.selectbox("Trimestre", list(QUARTER_END_DATES.keys()))
         reference_date = pd.Timestamp(QUARTER_END_DATES[selected_quarter])
+        quarter_start = pd.Timestamp(QUARTER_START_DATES[selected_quarter])
         quarter_suffix = f"_{selected_quarter[:2]}"   # "_T1", "_T2", "_T3", "_T4"
     else:
         reference_date = pd.Timestamp(f"{int(selected_year)}-12-31")
 
 opening_date = pd.Timestamp(f"{int(selected_year)}-01-01")
 
-st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date d'ouverture : **{opening_date.date()}**")
+if quarter_start is not None:
+    st.caption(
+        f"Trimestre retenu : **{quarter_start.date()} → {reference_date.date()}** "
+        f"| Date d'ouverture : **{opening_date.date()}**  \n"
+        "→ factures **payées dans le trimestre** + factures **non payées à la clôture** "
+        "(les factures payées avant le trimestre sont exclues)."
+    )
+else:
+    st.caption(f"Date de référence (clôture) : **{reference_date.date()}** | Date d'ouverture : **{opening_date.date()}**")
 
 st.divider()
 
@@ -1857,12 +1973,21 @@ def _sage_journal_inputs(key_prefix: str, *, fmt_label: str = "GL SAGE",
 def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = "",
                   payments_only_df=None):
     st.success("Traitement terminé avec succès.")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Lignes payées", len(paid_df))
-    c2.metric("Lignes non payées", len(unpaid_df))
-    c3.metric("Total lignes résultat", len(result_df))
+    fifo_df, real_unpaid_df = _split_fifo_rows(unpaid_df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Lignes payées (lettrées)", len(paid_df))
+    c2.metric("Lignes payées FIFO", len(fifo_df))
+    c3.metric("Lignes non payées", len(real_unpaid_df))
+    c4.metric("Total lignes résultat", len(result_df))
     st.subheader("Résultat global")
     st.dataframe(result_df, use_container_width=True)
+    if fifo_df is not None and not fifo_df.empty:
+        st.subheader("Factures payées par FIFO (paiement non lettré)")
+        st.caption(
+            "Factures soldées par un paiement non lettré rapproché en FIFO. "
+            "Le reliquat éventuellement non couvert reste dans « Factures non payées »."
+        )
+        st.dataframe(fifo_df, use_container_width=True)
     st.subheader("Contrôle fournisseurs détectés")
     st.dataframe(control_df, use_container_width=True)
     if payments_only_df is not None and not payments_only_df.empty:
@@ -1925,22 +2050,22 @@ if not is_cheval:
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_pennyland(
                         uploaded_file, selected_sheet, reference_date, opening_date,
                         invoice_journals=sage_inv_j, payment_journals=sage_pay_j,
-                        is_quarterly=_is_q,
+                        is_quarterly=_is_q, quarter_start=quarter_start,
                     )
                 elif gl_fmt == "sage":
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_sage(
                         uploaded_file, selected_sheet, reference_date, opening_date,
-                        sage_inv_j, sage_pay_j, is_quarterly=_is_q,
+                        sage_inv_j, sage_pay_j, is_quarterly=_is_q, quarter_start=quarter_start,
                     )
                 elif gl_fmt == "lacto":
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook_lacto(
                         uploaded_file, selected_sheet, reference_date, opening_date,
-                        sage_inv_j, sage_pay_j, is_quarterly=_is_q,
+                        sage_inv_j, sage_pay_j, is_quarterly=_is_q, quarter_start=quarter_start,
                     )
                 else:
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook(
                         uploaded_file, selected_sheet, reference_date, opening_date,
-                        is_quarterly=_is_q,
+                        is_quarterly=_is_q, quarter_start=quarter_start,
                     )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
                               int(selected_year), suffix=quarter_suffix,
@@ -2036,7 +2161,7 @@ else:
                     reference_date, opening_date,
                     invoice_journals1=sage_inv_j1, payment_journals1=sage_pay_j1,
                     invoice_journals2=sage_inv_j2, payment_journals2=sage_pay_j2,
-                    is_quarterly=(decl_type == "Trimestrielle"),
+                    is_quarterly=(decl_type == "Trimestrielle"), quarter_start=quarter_start,
                 )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
                               int(selected_year), suffix=f"_cheval{quarter_suffix}",

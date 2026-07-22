@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environnements virtuels
+venv/
+.venv/
+env/
+
+# Outils locaux / éditeur
+.claude/
+.vscode/
+.idea/
+
+# Fichiers temporaires
+*.tmp
+~$*
