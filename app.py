@@ -766,6 +766,10 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     """
     paid_rows = []
     unpaid_rows = []
+    # Montant des factures écartées car réglées AVANT le trimestre (trimestriel).
+    # Sert à réconcilier la ligne de contrôle (elles sont dans le crédit source
+    # mais volontairement absentes des factures retenues).
+    excluded_before_amount = 0.0
 
     has_source_file = "source_file" in supplier_df.columns
 
@@ -886,6 +890,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 # Payé AVANT le début du trimestre → réglé sur un trimestre
                 # antérieur → hors périmètre de cette déclaration.
                 if _qc == "before":
+                    excluded_before_amount += round(allocated_amount, 2)
                     continue
 
                 # Payé APRÈS la clôture → facture NON PAYÉE à la clôture du trimestre.
@@ -995,6 +1000,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             # le début du trimestre → hors périmètre. On consomme la facture (pour ne
             # pas la relister en non payée) sans l'émettre comme payée.
             if _quarter_class(opening_date) == "before":
+                excluded_before_amount += round(allocated_amount, 2)
                 consumed_invoice_ids.add(int(inv["original_row"]))
                 continue
 
@@ -1055,6 +1061,7 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
             # Trimestriel : payé AVANT le début du trimestre → hors déclaration.
             # (les paiements non lettrés sont déjà filtrés ≤ clôture → pas de cas 'after' ici)
             if _quarter_class(payment_date) == "before":
+                excluded_before_amount += round(allocated_amount, 2)
                 continue
 
             if pd.isna(invoice_date) or pd.isna(payment_date):
@@ -1142,18 +1149,21 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
                 "Ligne source facture": int(inv["original_row"]) + 2,
             })
 
-    return paid_rows, unpaid_rows
+    return paid_rows, unpaid_rows, round(excluded_before_amount, 2)
 
 
 def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                         year_filter: int = None, gl_format: str = "coala",
                         reference_date: pd.Timestamp = None,
-                        invoice_journals: Optional[List[str]] = None):
+                        invoice_journals: Optional[List[str]] = None,
+                        excluded_before_amount: float = 0.0):
     """Calcule la ligne de contrôle pour un fournisseur.
     year_filter    : si fourni, on ne comptabilise que les crédits dont la DateOperation est dans cette année.
     gl_format      : détection du solde d'ouverture adaptée au format.
     reference_date : si fourni, on exclut les crédits postérieurs à cette date (utile en mode trimestriel).
     invoice_journals : pour SAGE, liste des codes journaux facture.
+    excluded_before_amount : montant des factures écartées car payées avant le trimestre
+                             (trimestriel) — retiré du crédit source pour la réconciliation.
     """
     _AN_JOURNALS = {"AA", "AD", "AN"}
     journals_upper = supplier_df["JournalColC"].str.upper()
@@ -1204,7 +1214,11 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
         factures_reconstituees[key] = factures_reconstituees.get(key, 0.0) + float(r.get("Montant facture", 0) or 0)
 
     total_factures_retenues = round(sum(factures_reconstituees.values()), 2)
-    ecart = round(total_credit_source - total_factures_retenues, 2)
+    # En trimestriel, les factures réglées avant le trimestre sont volontairement
+    # exclues des factures retenues ; on les retire aussi du crédit source pour que
+    # l'écart ne reflète que les vrais problèmes de rapprochement.
+    excluded_before_amount = round(excluded_before_amount or 0.0, 2)
+    ecart = round(total_credit_source - total_factures_retenues - excluded_before_amount, 2)
 
     return {
         "Code fournisseur": boundary.supplier_code,
@@ -1213,6 +1227,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
         "Nb lignes non payées": len(unpaid_rows),
         "Total crédit source": total_credit_source,
         "Total factures retenues": total_factures_retenues,
+        "Exclu (payé avant trimestre)": excluded_before_amount,
         "Écart": ecart,
         "Statut contrôle": "OK" if abs(ecart) < 0.01 else "Écart à analyser",
     }
@@ -1278,7 +1293,7 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
 
     for boundary in suppliers:
         supplier_df = prepare_supplier_data(df, boundary)
-        paid_rows, unpaid_rows = process_supplier(boundary, supplier_df, reference_date, opening_date,
+        paid_rows, unpaid_rows, excluded_before = process_supplier(boundary, supplier_df, reference_date, opening_date,
                                                    mode="civile", year_filter=year, is_quarterly=is_quarterly,
                                                    quarter_start=quarter_start)
 
@@ -1288,7 +1303,8 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
 
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
-        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, reference_date=reference_date))
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, reference_date=reference_date,
+                                               excluded_before_amount=excluded_before))
 
         if not paid_rows and not unpaid_rows:
             all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1347,7 +1363,7 @@ def process_workbook_cheval(file1, sheet1, file2, sheet2,
 
         supplier_df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
 
-        paid_rows, unpaid_rows = process_supplier(boundary, supplier_df, reference_date, opening_date, mode="cheval", year_filter=None)
+        paid_rows, unpaid_rows, _excluded = process_supplier(boundary, supplier_df, reference_date, opening_date, mode="cheval", year_filter=None)
 
         # Filtre final : uniquement les factures de l'année choisie
         paid_rows = _filter_by_year(paid_rows, valid_years)
@@ -1445,7 +1461,7 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
 
     for boundary in suppliers:
         supplier_df = prepare_supplier_data_pennyland(df, boundary)
-        paid_rows, unpaid_rows = process_supplier(
+        paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="pennyland",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
@@ -1460,7 +1476,8 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                year_filter=year, gl_format="pennyland",
                                reference_date=reference_date,
-                               invoice_journals=invoice_journals)
+                               invoice_journals=invoice_journals,
+                               excluded_before_amount=excluded_before)
         )
         if not paid_rows and not unpaid_rows:
             all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1489,7 +1506,7 @@ def process_workbook_sage(uploaded_file, sheet_name,
 
     for boundary in suppliers:
         supplier_df = prepare_supplier_data_sage(df, boundary)
-        paid_rows, unpaid_rows = process_supplier(
+        paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="sage",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
@@ -1503,7 +1520,8 @@ def process_workbook_sage(uploaded_file, sheet_name,
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                year_filter=year, gl_format="sage",
                                reference_date=reference_date,
-                               invoice_journals=invoice_journals)
+                               invoice_journals=invoice_journals,
+                               excluded_before_amount=excluded_before)
         )
         if not paid_rows and not unpaid_rows:
             all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1539,7 +1557,7 @@ def process_workbook_lacto(uploaded_file, sheet_name,
 
     for boundary in suppliers:
         supplier_df = prepare_supplier_data_lacto(df, boundary)
-        paid_rows, unpaid_rows = process_supplier(
+        paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="lacto",
             invoice_journals=invoice_journals, payment_journals=payment_journals,
@@ -1553,7 +1571,8 @@ def process_workbook_lacto(uploaded_file, sheet_name,
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                year_filter=year, gl_format="lacto",
                                reference_date=reference_date,
-                               invoice_journals=invoice_journals)
+                               invoice_journals=invoice_journals,
+                               excluded_before_amount=excluded_before)
         )
         if not paid_rows and not unpaid_rows:
             all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1602,7 +1621,7 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
 
     for boundary in suppliers:
         supplier_df = prep_fn(df, boundary, row_offset=row_offset)
-        paid_rows, unpaid_rows = process_supplier(
+        paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format=gl_fmt,
             invoice_journals=invoice_journals, payment_journals=payment_journals,
@@ -1615,7 +1634,8 @@ def _process_one_file_cheval(df, find_fn, prep_fn, gl_fmt: str,
         ctrl.append(
             _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                year_filter=year, gl_format=gl_fmt,
-                               reference_date=reference_date)
+                               reference_date=reference_date,
+                               excluded_before_amount=excluded_before)
         )
         if not paid_rows and not unpaid_rows:
             payments_only.extend(_collect_payments_only(boundary, supplier_df))
@@ -1681,7 +1701,7 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
 
             supplier_df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
 
-            paid_rows, unpaid_rows = process_supplier(
+            paid_rows, unpaid_rows, excluded_before = process_supplier(
                 boundary, supplier_df, reference_date, opening_date,
                 mode="cheval", year_filter=None, gl_format=combined_gl_format,
                 invoice_journals=invoice_journals1, payment_journals=payment_journals1,
@@ -1696,7 +1716,8 @@ def process_workbook_cheval_generic(file1, sheet1, gl_format1: str,
                 _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
                                    year_filter=year, gl_format=combined_gl_format,
                                    reference_date=reference_date,
-                                   invoice_journals=invoice_journals1)
+                                   invoice_journals=invoice_journals1,
+                                   excluded_before_amount=excluded_before)
             )
             if not paid_rows and not unpaid_rows:
                 all_payments_only.extend(_collect_payments_only(boundary, supplier_df))
