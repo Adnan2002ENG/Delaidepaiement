@@ -1274,6 +1274,30 @@ def _collect_payments_only(boundary, supplier_df) -> list:
     return out
 
 
+def _prepare_suppliers_grouped(df, suppliers, prepare_fn):
+    """Regroupe les blocs NON CONSÉCUTIFS d'un même fournisseur.
+
+    Certains grands livres présentent un fournisseur en plusieurs blocs séparés
+    (ex : l'à-nouveau détaillé regroupé en haut de la feuille, puis les mouvements
+    de l'année plus bas). find_supplier_boundaries_* renvoie alors une frontière
+    par bloc. On concatène ici les données de tous les blocs d'un même code
+    fournisseur pour que le rapprochement lettrage facture/paiement se fasse sur
+    l'ENSEMBLE des lignes du fournisseur (sinon une facture à-nouveau et son
+    paiement, situés dans deux blocs différents, ne se retrouvent jamais).
+
+    Retourne une liste de (boundary, supplier_df) : un élément par code fournisseur.
+    """
+    groups = {}
+    for b in suppliers:
+        groups.setdefault(b.supplier_code, []).append(b)
+    result = []
+    for code, blist in groups.items():
+        parts = [prepare_fn(df, b) for b in blist]
+        sdf = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+        result.append((blist[0], sdf))
+    return result
+
+
 def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, opening_date: pd.Timestamp,
                      is_quarterly: bool = False, quarter_start: Optional[pd.Timestamp] = None):
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
@@ -1291,8 +1315,7 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
     all_payments_only = []
     year = reference_date.year
 
-    for boundary in suppliers:
-        supplier_df = prepare_supplier_data(df, boundary)
+    for boundary, supplier_df in _prepare_suppliers_grouped(df, suppliers, prepare_supplier_data):
         paid_rows, unpaid_rows, excluded_before = process_supplier(boundary, supplier_df, reference_date, opening_date,
                                                    mode="civile", year_filter=year, is_quarterly=is_quarterly,
                                                    quarter_start=quarter_start)
@@ -1459,8 +1482,7 @@ def process_workbook_pennyland(uploaded_file, sheet_name,
     all_payments_only = []
     year         = reference_date.year
 
-    for boundary in suppliers:
-        supplier_df = prepare_supplier_data_pennyland(df, boundary)
+    for boundary, supplier_df in _prepare_suppliers_grouped(df, suppliers, prepare_supplier_data_pennyland):
         paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="pennyland",
@@ -1504,8 +1526,7 @@ def process_workbook_sage(uploaded_file, sheet_name,
     all_payments_only = []
     year = reference_date.year
 
-    for boundary in suppliers:
-        supplier_df = prepare_supplier_data_sage(df, boundary)
+    for boundary, supplier_df in _prepare_suppliers_grouped(df, suppliers, prepare_supplier_data_sage):
         paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="sage",
@@ -1555,8 +1576,7 @@ def process_workbook_lacto(uploaded_file, sheet_name,
     all_payments_only = []
     year = reference_date.year
 
-    for boundary in suppliers:
-        supplier_df = prepare_supplier_data_lacto(df, boundary)
+    for boundary, supplier_df in _prepare_suppliers_grouped(df, suppliers, prepare_supplier_data_lacto):
         paid_rows, unpaid_rows, excluded_before = process_supplier(
             boundary, supplier_df, reference_date, opening_date,
             mode="civile", year_filter=year, gl_format="lacto",
