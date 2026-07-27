@@ -835,9 +835,11 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
     invoice_excl_mask = opening_mask & ~_is_min_plus.fillna(False)
 
-    # --- Fonction d'allocation lettrée (varie selon le format) ---
-    # Pour "mixed" et "pennyland" : matching par montant (avec fallback FIFO intégré)
-    _alloc_lettered = allocate_fifo if gl_format == "coala" else allocate_amount_match
+    # --- Fonction d'allocation lettrée (identique pour tous les formats) ---
+    # Rapprochement par montant identique puis FIFO sur le reste (plus juste que
+    # le FIFO pur : un paiement du montant exact d'une facture lui est rattaché
+    # en priorité). Appliqué désormais aussi à COALA.
+    _alloc_lettered = allocate_amount_match
 
     # ============================================================
     # 1) FACTURES LETTRÉES / PAIEMENTS LETTRÉS
