@@ -815,8 +815,8 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # --- Masques journaux (factures / paiements) ---
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
     pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
-    if gl_format in ("coala", "sage", "lacto"):
-        # COALA/SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
+    if gl_format in ("sage", "lacto"):
+        # SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
         pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
     elif gl_format == "pennyland" and (inv_j or pay_j):
@@ -1198,7 +1198,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
 
     # Masque journaux factures (SAGE/LACTO obligatoire ; PENNYLANE optionnel)
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
-    if gl_format in ("coala", "sage", "lacto"):
+    if gl_format in ("sage", "lacto"):
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "pennyland" and inv_j:
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
@@ -1225,19 +1225,25 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     # les retire du crédit source pour la réconciliation (la facture retenue est
     # déjà nette de l'avoir).
     pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
-    avoir_mask = (
-        (supplier_df["Debit"] > 0)
-        & (supplier_df["Lettrage"] != "")
-        & (~opening_excl)
-        & inv_journal_mask
-        & (~journals_upper.isin(pay_j))
-        & (supplier_df["DateOperation"].dt.year >= _min_y)
-    )
-    if year_filter is not None:
-        avoir_mask = avoir_mask & (supplier_df["DateOperation"].dt.year <= year_filter)
-    if reference_date is not None:
-        avoir_mask = avoir_mask & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
-    total_avoirs = round(supplier_df.loc[avoir_mask, "Debit"].sum(), 2)
+    # On ne sait distinguer un avoir (débit en journal facture) d'un paiement que si
+    # les journaux de paiement sont connus. Sans eux (ex. COALA en détection auto),
+    # on ne déduit aucun avoir.
+    if pay_j:
+        avoir_mask = (
+            (supplier_df["Debit"] > 0)
+            & (supplier_df["Lettrage"] != "")
+            & (~opening_excl)
+            & inv_journal_mask
+            & (~journals_upper.isin(pay_j))
+            & (supplier_df["DateOperation"].dt.year >= _min_y)
+        )
+        if year_filter is not None:
+            avoir_mask = avoir_mask & (supplier_df["DateOperation"].dt.year <= year_filter)
+        if reference_date is not None:
+            avoir_mask = avoir_mask & (supplier_df["DateOperation"].isna() | (supplier_df["DateOperation"] <= reference_date))
+        total_avoirs = round(supplier_df.loc[avoir_mask, "Debit"].sum(), 2)
+    else:
+        total_avoirs = 0.0
 
     all_rows = paid_rows + unpaid_rows
     factures_reconstituees = {}
@@ -2124,7 +2130,7 @@ if not is_cheval:
         )
 
     sage_inv_j, sage_pay_j, sage_valid = [], [], True
-    if gl_fmt_label in ("GL COALA", "GL SAGE", "GL LACTO"):
+    if gl_fmt_label in ("GL SAGE", "GL LACTO"):
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
             "civile", fmt_label=gl_fmt_label, required=True
         )
@@ -2143,7 +2149,7 @@ if not is_cheval:
 
         selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
 
-        btn_disabled = (gl_fmt_label in ("GL COALA", "GL SAGE", "GL LACTO")) and not sage_valid
+        btn_disabled = (gl_fmt_label in ("GL SAGE", "GL LACTO")) and not sage_valid
         if st.button("Lancer le traitement", type="primary", disabled=btn_disabled):
             try:
                 uploaded_file.seek(0)
@@ -2210,7 +2216,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N-1 : {e}")
         sage_inv_j1, sage_pay_j1, sage_valid1 = [], [], True
-        if gl_fmt1_label in ("GL COALA", "GL SAGE", "GL LACTO"):
+        if gl_fmt1_label in ("GL SAGE", "GL LACTO"):
             sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
                 "cheval1", fmt_label=gl_fmt1_label, required=True
             )
@@ -2237,7 +2243,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N : {e}")
         sage_inv_j2, sage_pay_j2, sage_valid2 = [], [], True
-        if gl_fmt2_label in ("GL COALA", "GL SAGE", "GL LACTO"):
+        if gl_fmt2_label in ("GL SAGE", "GL LACTO"):
             sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
                 "cheval2", fmt_label=gl_fmt2_label, required=True
             )
