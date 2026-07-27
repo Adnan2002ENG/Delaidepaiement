@@ -815,8 +815,8 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # --- Masques journaux (factures / paiements) ---
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
     pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
-    if gl_format in ("sage", "lacto"):
-        # SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
+    if gl_format in ("coala", "sage", "lacto"):
+        # COALA/SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
         pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
     elif gl_format == "pennyland" and (inv_j or pay_j):
@@ -1194,7 +1194,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
 
     # Masque journaux factures (SAGE/LACTO obligatoire ; PENNYLANE optionnel)
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
-    if gl_format in ("sage", "lacto"):
+    if gl_format in ("coala", "sage", "lacto"):
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
     elif gl_format == "pennyland" and inv_j:
         inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
@@ -1306,7 +1306,9 @@ def _prepare_suppliers_grouped(df, suppliers, prepare_fn):
 
 
 def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, opening_date: pd.Timestamp,
-                     is_quarterly: bool = False, quarter_start: Optional[pd.Timestamp] = None):
+                     is_quarterly: bool = False, quarter_start: Optional[pd.Timestamp] = None,
+                     invoice_journals: Optional[List[str]] = None,
+                     payment_journals: Optional[List[str]] = None):
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
 
     if df.shape[1] < 8:
@@ -1324,8 +1326,9 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
 
     for boundary, supplier_df in _prepare_suppliers_grouped(df, suppliers, prepare_supplier_data):
         paid_rows, unpaid_rows, excluded_before = process_supplier(boundary, supplier_df, reference_date, opening_date,
-                                                   mode="civile", year_filter=year, is_quarterly=is_quarterly,
-                                                   quarter_start=quarter_start)
+                                                   mode="civile", year_filter=year, gl_format="coala",
+                                                   invoice_journals=invoice_journals, payment_journals=payment_journals,
+                                                   is_quarterly=is_quarterly, quarter_start=quarter_start)
 
         # Filtre final : on ne garde que les factures de l'année choisie
         paid_rows = _filter_by_year(paid_rows, year)
@@ -1333,7 +1336,8 @@ def process_workbook(uploaded_file, sheet_name, reference_date: pd.Timestamp, op
 
         all_paid.extend(paid_rows)
         all_unpaid.extend(unpaid_rows)
-        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, reference_date=reference_date,
+        control_rows.append(_build_control_row(boundary, paid_rows, unpaid_rows, supplier_df, gl_format="coala",
+                                               reference_date=reference_date, invoice_journals=invoice_journals,
                                                excluded_before_amount=excluded_before))
 
         if not paid_rows and not unpaid_rows:
@@ -2077,7 +2081,7 @@ if not is_cheval:
         )
 
     sage_inv_j, sage_pay_j, sage_valid = [], [], True
-    if gl_fmt_label in ("GL SAGE", "GL LACTO"):
+    if gl_fmt_label in ("GL COALA", "GL SAGE", "GL LACTO"):
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
             "civile", fmt_label=gl_fmt_label, required=True
         )
@@ -2096,7 +2100,7 @@ if not is_cheval:
 
         selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
 
-        btn_disabled = (gl_fmt_label in ("GL SAGE", "GL LACTO")) and not sage_valid
+        btn_disabled = (gl_fmt_label in ("GL COALA", "GL SAGE", "GL LACTO")) and not sage_valid
         if st.button("Lancer le traitement", type="primary", disabled=btn_disabled):
             try:
                 uploaded_file.seek(0)
@@ -2122,6 +2126,7 @@ if not is_cheval:
                     result_df, paid_df, unpaid_df, control_df, po_df = process_workbook(
                         uploaded_file, selected_sheet, reference_date, opening_date,
                         is_quarterly=_is_q, quarter_start=quarter_start,
+                        invoice_journals=sage_inv_j, payment_journals=sage_pay_j,
                     )
                 _show_results(result_df, paid_df, unpaid_df, control_df,
                               int(selected_year), suffix=quarter_suffix,
@@ -2162,7 +2167,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N-1 : {e}")
         sage_inv_j1, sage_pay_j1, sage_valid1 = [], [], True
-        if gl_fmt1_label in ("GL SAGE", "GL LACTO"):
+        if gl_fmt1_label in ("GL COALA", "GL SAGE", "GL LACTO"):
             sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
                 "cheval1", fmt_label=gl_fmt1_label, required=True
             )
@@ -2189,7 +2194,7 @@ else:
             except Exception as e:
                 st.error(f"Impossible de lire le fichier N : {e}")
         sage_inv_j2, sage_pay_j2, sage_valid2 = [], [], True
-        if gl_fmt2_label in ("GL SAGE", "GL LACTO"):
+        if gl_fmt2_label in ("GL COALA", "GL SAGE", "GL LACTO"):
             sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
                 "cheval2", fmt_label=gl_fmt2_label, required=True
             )
