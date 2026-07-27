@@ -88,6 +88,11 @@ class SupplierBoundary:
 def normalize_text(value) -> str:
     if pd.isna(value):
         return ""
+    # Un nombre entier lu en float (ex. quand la feuille est lue sans en-tête et
+    # qu'une colonne devient float à cause d'une cellule vide) : on retire le ".0"
+    # pour que les comptes / journaux / n° pièce restent propres ("44110097.0" -> "44110097").
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value).strip()
 
 
@@ -1430,12 +1435,18 @@ def _read_pennyland(uploaded_file, sheet_name) -> pd.DataFrame:
 
 
 def _read_sage(uploaded_file, sheet_name) -> pd.DataFrame:
-    """Lit un GL SAGE en détectant automatiquement la ligne d'en-tête (0 ou 1).
-    Certains exports placent un titre en ligne 0 (en-tête réel en ligne 1),
-    d'autres mettent l'en-tête « COMPTE / DATE / ... / DEBIT / CREDIT »
-    directement en ligne 0. On accepte les deux pour ne perdre aucune ligne.
+    """Lit un GL SAGE en détectant automatiquement la ligne d'en-tête.
+    Cas gérés :
+      • en-tête « COMPTE / DATE / ... / DEBIT / CREDIT » en ligne 0 ou 1 → détecté ;
+      • AUCUN en-tête (données dès la 1ère ligne, éventuellement précédées d'une
+        ligne vide) → on lit SANS en-tête (header=None) pour NE PERDRE AUCUNE
+        ligne de données. Sinon `header=1` consommerait la 1ère opération comme
+        en-tête (ex. le 1er paiement d'un fournisseur), ce qui fausse ensuite
+        tout le rapprochement lettré.
+    Les colonnes SAGE étant lues par position, l'absence d'en-tête nommé n'est
+    pas un problème ; les nombres lus en float (« 1.0 ») sont nettoyés par
+    normalize_text.
     """
-    last_df = None
     for h in (0, 1):
         try:
             try:
@@ -1445,15 +1456,17 @@ def _read_sage(uploaded_file, sheet_name) -> pd.DataFrame:
             df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=h)
         except Exception:
             continue
-        last_df = df
         cols_n = [_norm_header(c) for c in df.columns]
         has_compte  = any("compte" in c for c in cols_n)
         has_montant = any(c in ("debit", "credit") for c in cols_n)
         if has_compte and has_montant:
             return df
-    if last_df is None:
-        raise ValueError("Impossible de lire le fichier GL SAGE.")
-    return last_df
+    # Pas d'en-tête reconnu → lecture brute sans en-tête (aucune ligne perdue).
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    return pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
 
 def process_workbook_pennyland(uploaded_file, sheet_name,
