@@ -209,6 +209,18 @@ def extract_invoice_number(piece_text: str, libelle_text: str) -> str:
     return ""
 
 
+# Certains exports suffixent le code journal par une flèche et un code de
+# centralisation : « HA --> E », « BQ --> E ». La comparaison avec les journaux
+# saisis par l'utilisateur se fait sur le code seul, pour qu'il puisse taper
+# « HA » plutôt que « HA --> E ».
+_JOURNAL_SUFFIX_RE = re.compile(r"\s*-+>.*$")
+
+
+def _journal_codes(journals_upper: pd.Series) -> pd.Series:
+    """« HA --> E » → « HA ». Sans flèche, la valeur est renvoyée inchangée."""
+    return journals_upper.str.replace(_JOURNAL_SUFFIX_RE, "", regex=True).str.strip()
+
+
 def _norm_header(s: str) -> str:
     """Normalise un en-tête pour comparaison robuste (accents, casse, espaces, ponctuation)."""
     s = str(s or "").lower()
@@ -820,17 +832,20 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     # --- Masques journaux (factures / paiements) ---
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
     pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
+    journal_codes = _journal_codes(journals_upper)
     if gl_format in ("sage", "lacto"):
         # SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
-        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
-        pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
-    elif gl_format == "pennyland" and (inv_j or pay_j):
-        # PENNYLANE : journaux saisis (facultatifs). Si non fournis → comportement historique.
+        inv_journal_mask = journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+        pay_journal_mask = journal_codes.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
+    elif inv_j or pay_j:
+        # COALA / PENNYLANE : journaux facultatifs. Fournis → ils font foi (utile
+        # quand le journal d'achat ne commence pas par « A », ex. « HA »).
+        # Absents → détection auto historique.
         inv_journal_mask = (
-            journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+            journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
             if inv_j else journals_upper.str.startswith("A", na=False)
         )
-        pay_journal_mask = journals_upper.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
+        pay_journal_mask = journal_codes.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
     else:
         inv_journal_mask = journals_upper.str.startswith("A", na=False)
         pay_journal_mask = pd.Series(True, index=supplier_df.index)
@@ -1201,12 +1216,13 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     _is_min_plus = supplier_df["DateOperation"].dt.year >= _min_y
     opening_excl = opening_excl & ~_is_min_plus.fillna(False)
 
-    # Masque journaux factures (SAGE/LACTO obligatoire ; PENNYLANE optionnel)
+    # Masque journaux factures (SAGE/LACTO obligatoire ; COALA/PENNYLANE optionnel).
+    # Doit suivre EXACTEMENT la même règle que process_supplier, sinon le crédit
+    # source compte des lignes que le traitement a écartées → écart artificiel.
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
-    if gl_format in ("sage", "lacto"):
-        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
-    elif gl_format == "pennyland" and inv_j:
-        inv_journal_mask = journals_upper.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+    journal_codes = _journal_codes(journals_upper)
+    if gl_format in ("sage", "lacto") or inv_j:
+        inv_journal_mask = journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
     else:
         inv_journal_mask = pd.Series(True, index=supplier_df.index)
 
@@ -1239,7 +1255,7 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
             & (supplier_df["Lettrage"] != "")
             & (~opening_excl)
             & inv_journal_mask
-            & (~journals_upper.isin(pay_j))
+            & (~journal_codes.isin(pay_j))
             & (supplier_df["DateOperation"].dt.year >= _min_y)
         )
         if year_filter is not None:
@@ -2139,9 +2155,9 @@ if not is_cheval:
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
             "civile", fmt_label=gl_fmt_label, required=True
         )
-    elif gl_fmt_label == "GL PENNYLAND":
+    else:  # GL PENNYLAND / GL COALA : journaux facultatifs
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
-            "civile", fmt_label="GL PENNYLAND", required=False
+            "civile", fmt_label=gl_fmt_label, required=False
         )
 
     if uploaded_file is not None:
@@ -2225,9 +2241,9 @@ else:
             sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
                 "cheval1", fmt_label=gl_fmt1_label, required=True
             )
-        elif gl_fmt1_label == "GL PENNYLAND":
+        else:  # GL PENNYLAND / GL COALA : journaux facultatifs
             sage_inv_j1, sage_pay_j1, sage_valid1 = _sage_journal_inputs(
-                "cheval1", fmt_label="GL PENNYLAND", required=False
+                "cheval1", fmt_label=gl_fmt1_label, required=False
             )
 
     with col_f2:
@@ -2252,9 +2268,9 @@ else:
             sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
                 "cheval2", fmt_label=gl_fmt2_label, required=True
             )
-        elif gl_fmt2_label == "GL PENNYLAND":
+        else:  # GL PENNYLAND / GL COALA : journaux facultatifs
             sage_inv_j2, sage_pay_j2, sage_valid2 = _sage_journal_inputs(
-                "cheval2", fmt_label="GL PENNYLAND", required=False
+                "cheval2", fmt_label=gl_fmt2_label, required=False
             )
 
     both_ready = (
