@@ -114,9 +114,14 @@ def safe_date(value):
         return pd.NaT
 
 
+# Préfixes acceptés pour un code fournisseur COALA en colonne A.
+# "9" : plan de comptes historique. "4" : comptes fournisseurs classiques (441…).
+SUPPLIER_CODE_PREFIXES = ("9", "4")
+
+
 def extract_supplier_info(cell_value: str) -> Optional[Tuple[str, str]]:
     text = normalize_text(cell_value)
-    if not text.startswith("9"):
+    if not text.startswith(SUPPLIER_CODE_PREFIXES):
         return None
 
     first_space = text.find(" ")
@@ -1912,7 +1917,7 @@ with st.expander("Format attendu du fichier Excel", expanded=False):
     with tab_coala:
         st.markdown(
             """
-- **Colonne A** : début/fin fournisseur (ligne avec code « 9XXXX Nom »)
+- **Colonne A** : début/fin fournisseur (ligne avec code « 9XXXX Nom » ou « 4XXXX Nom »)
 - **Colonne B** : date
 - **Colonne C** : journal
 - **Colonne D** : pièce
