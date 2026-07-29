@@ -833,6 +833,13 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     inv_j = [j.strip().upper() for j in (invoice_journals or []) if j.strip()]
     pay_j = [j.strip().upper() for j in (payment_journals or []) if j.strip()]
     journal_codes = _journal_codes(journals_upper)
+    # Détection auto des factures (aucun journal saisi) : journal commençant par « A »
+    # (achats, à-nouveau). En COALA on ajoute « OD » (Opérations Diverses), où des
+    # factures fournisseurs sont parfois passées et que « commence par A » ratait
+    # (leurs paiements lettrés devenaient alors orphelins).
+    _auto_inv = journals_upper.str.startswith("A", na=False)
+    if gl_format == "coala":
+        _auto_inv = _auto_inv | journals_upper.str.startswith("OD", na=False)
     if gl_format in ("sage", "lacto"):
         # SAGE/LACTO : journaux saisis par l'utilisateur ; AN-AA-AD toujours inclus en facture
         inv_journal_mask = journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
@@ -840,14 +847,14 @@ def process_supplier(boundary: SupplierBoundary, supplier_df: pd.DataFrame,
     elif inv_j or pay_j:
         # COALA / PENNYLANE : journaux facultatifs. Fournis → ils font foi (utile
         # quand le journal d'achat ne commence pas par « A », ex. « HA »).
-        # Absents → détection auto historique.
+        # Absents → détection auto.
         inv_journal_mask = (
             journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
-            if inv_j else journals_upper.str.startswith("A", na=False)
+            if inv_j else _auto_inv
         )
         pay_journal_mask = journal_codes.isin(pay_j) if pay_j else pd.Series(True, index=supplier_df.index)
     else:
-        inv_journal_mask = journals_upper.str.startswith("A", na=False)
+        inv_journal_mask = _auto_inv
         pay_journal_mask = pd.Series(True, index=supplier_df.index)
 
     # Pour min_year+ : les à nouveau (AA/AD/AN) sont inclus comme factures (montant crédit)
@@ -1223,6 +1230,9 @@ def _build_control_row(boundary, paid_rows, unpaid_rows, supplier_df,
     journal_codes = _journal_codes(journals_upper)
     if gl_format in ("sage", "lacto") or inv_j:
         inv_journal_mask = journal_codes.isin(inv_j) | journals_upper.isin(_AN_JOURNALS)
+    elif gl_format == "coala":
+        # Même détection auto que le traitement : factures = journal « A » ou « OD ».
+        inv_journal_mask = journals_upper.str.startswith("A", na=False) | journals_upper.str.startswith("OD", na=False)
     else:
         inv_journal_mask = pd.Series(True, index=supplier_df.index)
 
