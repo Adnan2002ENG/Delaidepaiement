@@ -2110,6 +2110,44 @@ def _sage_journal_inputs(key_prefix: str, *, fmt_label: str = "GL SAGE",
         valid = True
     return inv, pay, valid
 
+def _coala_journal_options(uploaded_file, sheet_name) -> List[str]:
+    """Codes journaux distincts (col C) d'un GL COALA, suffixe « --> E » retiré, triés."""
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    try:
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
+    except Exception:
+        return []
+    if df.shape[1] < 3:
+        return []
+    col = df.iloc[:, 2].dropna().astype(str).str.strip().str.upper()
+    codes = _journal_codes(col)
+    return sorted({c for c in codes.tolist() if c and c != "NAN"})
+
+
+def _coala_journal_multiselect(key_prefix: str, options: List[str]) -> Tuple[List[str], List[str]]:
+    """Deux menus déroulants (factures / paiements) + case « Tout sélectionner » chacun.
+    Retourne (inv, pay). Listes vides = détection auto (journal « A » / « OD »).
+    """
+    st.caption(
+        "Format GL COALA : choisissez les **journaux des factures** et des **paiements** "
+        "dans les menus (ou cochez « Tout sélectionner »). "
+        "Laisser vide = détection automatique (journaux « A » / « OD »)."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        all_inv = st.checkbox("Tout sélectionner — factures", key=f"{key_prefix}_inv_all")
+        inv_sel = st.multiselect("Journaux des factures", options, key=f"{key_prefix}_inv_ms")
+        inv = list(options) if all_inv else inv_sel
+    with col2:
+        all_pay = st.checkbox("Tout sélectionner — paiements", key=f"{key_prefix}_pay_all")
+        pay_sel = st.multiselect("Journaux des paiements", options, key=f"{key_prefix}_pay_ms")
+        pay = list(options) if all_pay else pay_sel
+    return inv, pay
+
+
 def _show_results(result_df, paid_df, unpaid_df, control_df, year: int, suffix: str = "",
                   payments_only_df=None):
     st.success("Traitement terminé avec succès.")
@@ -2165,10 +2203,11 @@ if not is_cheval:
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
             "civile", fmt_label=gl_fmt_label, required=True
         )
-    else:  # GL PENNYLAND / GL COALA : journaux facultatifs
+    elif gl_fmt_label == "GL PENNYLAND":  # journaux facultatifs (champs texte)
         sage_inv_j, sage_pay_j, sage_valid = _sage_journal_inputs(
-            "civile", fmt_label=gl_fmt_label, required=False
+            "civile", fmt_label="GL PENNYLAND", required=False
         )
+    # GL COALA : menus déroulants des journaux affichés après le choix de la feuille.
 
     if uploaded_file is not None:
         try:
@@ -2179,6 +2218,13 @@ if not is_cheval:
             st.stop()
 
         selected_sheet = st.selectbox("Choisir la feuille à traiter", sheet_options)
+
+        if gl_fmt_label == "GL COALA":
+            _coala_opts = _coala_journal_options(uploaded_file, selected_sheet)
+            if _coala_opts:
+                sage_inv_j, sage_pay_j = _coala_journal_multiselect("civile", _coala_opts)
+            else:
+                st.info("Journaux non détectés dans la feuille — détection automatique (A / OD) utilisée.")
 
         btn_disabled = (gl_fmt_label in ("GL SAGE", "GL LACTO")) and not sage_valid
         if st.button("Lancer le traitement", type="primary", disabled=btn_disabled):
